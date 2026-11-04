@@ -82,6 +82,33 @@ class ClassificationConfig:
 
 
 @dataclass
+class DualViewConfig:
+    # Feature flag to enable experimental dual-view registration & fusion
+    enabled: bool = False  # Feature flag default: False (safe single-view baseline preserved)
+    # Registration & Matching Parameters (raw sensor pixel coordinates at 600 DPI)
+    max_matching_distance_px: float = 35.0  # Max distance in unified raw sensor coords
+    ambiguity_delta_px: float = 8.0          # Nearest-neighbor ambiguity margin
+    cost_spatial_weight: float = 0.50        # Weight for reprojection distance
+    cost_area_weight: float = 0.30           # Weight for area difference
+    cost_aspect_ratio_weight: float = 0.20   # Weight for aspect ratio difference
+    max_hungarian_cost: float = 0.85         # Cost ceiling above which match is rejected
+    cluster_area_threshold_px: float = 9000.0 # Area threshold above which grain is segregated as unresolved cluster
+    cluster_solidity_threshold: float = 0.80 # Solidity threshold below which grain is considered cluster
+    # Static direct homography reference (Phase 3.2 raw coordinate reflection matrix)
+    homography_matrix: Tuple[Tuple[float, float, float], ...] = (
+        (-0.998463, -0.000463, 4917.872),
+        ( 0.001606,  0.999657,   21.086),
+        ( 0.000000,  0.000000,    1.000)
+    )
+    # Registration health checks
+    min_determinant: float = -1.05
+    max_determinant: float = -0.95
+    min_scale: float = 0.95
+    max_scale: float = 1.05
+    max_reprojection_rmse_px: float = 8.0
+
+
+@dataclass
 class ExportConfig:
     # Output generation settings.
     save_crops: bool = True
@@ -104,3 +131,4 @@ class PipelineConfig:
     measurement: MeasurementConfig = field(default_factory=MeasurementConfig)
     classification: ClassificationConfig = field(default_factory=ClassificationConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
+    dual_view: DualViewConfig = field(default_factory=DualViewConfig)

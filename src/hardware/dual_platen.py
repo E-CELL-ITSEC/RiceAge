@@ -11,6 +11,13 @@ import numpy as np
 import pandas as pd
 
 from src.classification import compute_quality_metrics, estimate_grain_mass, FutureDefectTaxonomy
+from src.dual_view import (
+    DualViewRegistration,
+    DualViewCorrespondenceEngine,
+    DualViewFusionEngine,
+    dataframe_to_view_observations,
+    CorrespondenceStatus
+)
 
 
 # Hardware Configuration (Defaulting to 300 DPI for safe ARM memory and fast 12s cycle)
@@ -126,9 +133,20 @@ class DualPlatenManager:
     Ensures memory efficiency, platen isolation, and unified metric reporting.
     """
 
-    def __init__(self, pipeline=None, scan_resolution: int = DEFAULT_SCAN_DPI):
+    def __init__(
+        self,
+        pipeline=None,
+        scan_resolution: int = DEFAULT_SCAN_DPI,
+        use_dual_view_fusion: Optional[bool] = None
+    ):
         self.pipeline = pipeline
         self.scan_resolution = scan_resolution
+        if use_dual_view_fusion is not None:
+            self.use_dual_view_fusion = use_dual_view_fusion
+        elif pipeline and getattr(pipeline.config, "dual_view", None):
+            self.use_dual_view_fusion = pipeline.config.dual_view.enabled
+        else:
+            self.use_dual_view_fusion = os.environ.get("ENABLE_DUAL_VIEW_FUSION", "0").lower() in ("1", "true", "yes")
 
     def run_dual_analysis(
         self,
@@ -194,7 +212,112 @@ class DualPlatenManager:
         else:
             raise FileNotFoundError("Neither bottom nor top platen images could be found.")
 
-        # 4. Merge Grain Measurements into Single Unified Dataset
+        # 4. Check Dual-View Prototype Feature Flag
+        df_b = dfs[0] if (len(dfs) > 0 and "bottom" in platens_info) else None
+        df_t = dfs[1] if (len(dfs) > 1 and "top" in platens_info) else (dfs[0] if (len(dfs) == 1 and "top" in platens_info) else None)
+
+        if self.use_dual_view_fusion and (df_b is not None or df_t is not None):
+            print("[DualPlatenManager] Executing Experimental Dual-View Registration & Canonical Fusion...")
+            # Extract calibration scale
+            calib_scale = None
+            for pinfo in platens_info.values():
+                scale_val = pinfo["summary"].get("calibration", {}).get("pixel_scale_mm")
+                if scale_val:
+                    calib_scale = scale_val
+                    break
+            pixel_scale = calib_scale or 0.08467
+
+            # Convert to ViewObservations
+            obs_b = dataframe_to_view_observations(df_b, "bottom", pixel_scale_mm=pixel_scale) if df_b is not None else []
+            obs_t = dataframe_to_view_observations(df_t, "top", pixel_scale_mm=pixel_scale) if df_t is not None else []
+
+            # Configure registration and correspondence
+            dv_cfg = getattr(self.pipeline.config, "dual_view", None) if self.pipeline else None
+            H_mat = dv_cfg.homography_matrix if dv_cfg else None
+            max_d = dv_cfg.max_matching_distance_px if dv_cfg else 35.0
+            amb_delta = dv_cfg.ambiguity_delta_px if dv_cfg else 8.0
+
+            reg = DualViewRegistration(homography_matrix=H_mat)
+            corr_engine = DualViewCorrespondenceEngine(
+                registration=reg,
+                max_matching_distance_px=max_d,
+                ambiguity_margin_px=amb_delta
+            )
+            fusion_engine = DualViewFusionEngine(
+                correspondence_engine=corr_engine,
+                pixel_scale_mm=pixel_scale
+            )
+
+            fusion_result = fusion_engine.fuse_views(obs_b, obs_t)
+            agg = fusion_result.aggregation_summary
+            cb = agg["count_basis"]
+            mb = agg["mass_basis"]
+            stats = agg["stats"]
+
+            grain_records = []
+            for g in fusion_result.physical_grains:
+                rec = {
+                    "grain_id": g.physical_grain_id,
+                    "correspondence_status": g.correspondence_status.value,
+                    "confidence": g.correspondence_confidence,
+                    "classification": g.quality_attributes.get("defect_class", "Good / Head Rice"),
+                    "length_mm": g.quality_attributes.get("length_mm", 0.0),
+                    "width_mm": g.quality_attributes.get("width_mm", 0.0),
+                    "area_px": g.quality_attributes.get("area_px", 0.0),
+                    "aspect_ratio": g.quality_attributes.get("aspect_ratio", 1.0),
+                    "estimated_mass_g": g.quality_attributes.get("estimated_mass_g", 0.0),
+                    "is_broken": g.quality_attributes.get("is_broken", False),
+                    "bottom_detection_id": g.bottom_observation_id,
+                    "top_detection_id": g.top_observation_id,
+                }
+                grain_records.append(rec)
+
+            rows = []
+            for s in stats:
+                rows.append({
+                    "name": s["param"],
+                    "limit": s["limit"],
+                    "resultPct": f"{s['mass_pct']:.2f}% (mass) / {s['pct']:.2f}% (cnt)",
+                    "resultCountAndGms": f"{s['count']} grains ({s['mass_g']:.3f} g)",
+                    "status": "acceptable" if "Min" in s["limit"] and s["mass_pct"] >= float(s["limit"].replace("Min ", "").replace("%", "")) or ("Max" in s["limit"] and s["mass_pct"] <= float(s["limit"].replace("Max ", "").replace("%", ""))) else "substandard"
+                })
+
+            return {
+                "status": "Complete",
+                "is_dual_view_prototype": True,
+                "commodity": commodity,
+                "serial": sample_id,
+                "sample_id": sample_id,
+                "timestamp": int(time.time()),
+                "timestamp_str": time.strftime("%d/%m/%Y %H:%M:%S"),
+                "total_objects": fusion_result.total_physical_grains,
+                "total_grains": fusion_result.total_physical_grains,
+                "total_sample_mass_g": fusion_result.estimated_mass_g,
+                "avg_length_mm": agg["avg_length_mm"],
+                "avg_breadth_mm": agg["avg_breadth_mm"],
+                "length_breadth_ratio": agg["length_breadth_ratio"],
+                "commercial_grade": "Grade 1 (Single Grain Canonical Fusion)" if cb["whole_pct"] >= 75.0 else "Substandard",
+                "disposition": "GRADE_1" if cb["whole_pct"] >= 75.0 else "SUBSTANDARD",
+                "count_basis": cb,
+                "mass_basis": mb,
+                "stats": stats,
+                "rows": rows,
+                "platens": platens_info,
+                "grain_records": grain_records,
+                "physical_grains": [g.to_dict() for g in fusion_result.physical_grains],
+                "dual_view_diagnostics": {
+                    "matched_count": fusion_result.matched_count,
+                    "unmatched_bottom_count": fusion_result.unmatched_bottom_count,
+                    "unmatched_top_count": fusion_result.unmatched_top_count,
+                    "ambiguous_count": fusion_result.ambiguous_count,
+                    "registration_failed_count": fusion_result.registration_failed_count,
+                    "unresolved_cluster_count": fusion_result.unresolved_cluster_count,
+                    "registration_health": fusion_result.registration_metadata
+                },
+                "composite_image": os.path.basename(composite_output_path) if composite_output_path else ""
+            }
+
+        # 4. Legacy Pipeline: Merge Grain Measurements into Single Unified Dataset
         if dfs:
             df_unified = pd.concat(dfs, ignore_index=True)
             df_unified["grain_id"] = list(range(1, len(df_unified) + 1))
