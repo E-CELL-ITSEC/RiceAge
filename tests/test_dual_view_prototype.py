@@ -53,7 +53,17 @@ def fusion_engine(correspondence_engine):
     return DualViewFusionEngine(correspondence_engine=correspondence_engine, pixel_scale_mm=0.08467)
 
 
-def make_obs(scanner_id: str, idx: int, cx: float, cy: float, area: float = 600.0, dclass: str = "Good / Head Rice", ar: float = 2.4):
+def make_obs(
+    scanner_id: str,
+    idx: int,
+    cx: float,
+    cy: float,
+    area: float = 600.0,
+    dclass: str = "Good / Head Rice",
+    ar: float = 2.4,
+    dconf: float = 0.95,
+    sep_status: str = "single_grain"
+):
     prefix = scanner_id[0].upper()
     return ViewObservation(
         observation_id=f"OBS_{prefix}_{idx:05d}",
@@ -67,7 +77,8 @@ def make_obs(scanner_id: str, idx: int, cx: float, cy: float, area: float = 600.
         width_mm=round(12 * 0.08467, 2),
         aspect_ratio=ar,
         defect_class=dclass,
-        defect_confidence=0.95
+        defect_confidence=dconf,
+        raw_features={"separation_status": sep_status}
     )
 
 
@@ -347,3 +358,233 @@ def test_reproduce_phase3_2_dropped_detection_b859_bug(calibrated_registration, 
 
     # Total physical grains = 1 matched + 1 unmatched top = 2
     assert res.total_physical_grains == 2
+
+
+# ============================================================================
+# Phase 4.1 Prototype Hardening Regression Tests
+# ============================================================================
+
+# Test 12: Every scanner observation has exactly one disposition
+def test_every_scanner_observation_has_exactly_one_disposition(calibrated_registration, fusion_engine):
+    """
+    Every input observation (bottom and top) must have exactly one documented disposition
+    in the final accounting, with no omissions or orphan observations.
+    """
+    bx1, by1 = 500.0, 500.0
+    _, tx1, ty1 = calibrated_registration.project_bottom_to_top(bx1, by1)
+    bx2, by2 = 800.0, 800.0
+    _, tx2, ty2 = calibrated_registration.project_bottom_to_top(bx2, by2)
+
+    b_obs = [
+        make_obs("bottom", 1, bx1, by1, area=600.0),
+        make_obs("bottom", 2, 200.0, 200.0, area=600.0),
+        make_obs("bottom", 3, bx2, by2, area=600.0),
+    ]
+    t_obs = [
+        make_obs("top", 1, tx1, ty1, area=600.0),
+        make_obs("top", 2, 4000.0, 4000.0, area=600.0),
+        make_obs("top", 3, tx2 + 10.0, ty2, area=600.0),
+        make_obs("top", 4, tx2 - 10.0, ty2, area=600.0),
+    ]
+
+    res = fusion_engine.fuse_views(b_obs, t_obs)
+
+    accounted_b = set()
+    accounted_t = set()
+
+    for g in res.physical_grains:
+        if g.bottom_observation_id:
+            assert g.bottom_observation_id not in accounted_b, f"Duplicate bottom observation {g.bottom_observation_id}"
+            accounted_b.add(g.bottom_observation_id)
+        if g.top_observation_id:
+            assert g.top_observation_id not in accounted_t, f"Duplicate top observation {g.top_observation_id}"
+            accounted_t.add(g.top_observation_id)
+
+    input_b_ids = {o.observation_id for o in b_obs}
+    input_t_ids = {o.observation_id for o in t_obs}
+
+    assert accounted_b == input_b_ids
+    assert accounted_t == input_t_ids
+
+
+# Test 13: Diagnostic categories do not double-count observations
+def test_diagnostic_categories_do_not_double_count_observations(calibrated_registration, fusion_engine):
+    """
+    Ensure all diagnostic categories (MATCHED, UNMATCHED, AMBIGUOUS, UNRESOLVED_CLUSTER)
+    form a strict partition of the input observation set.
+    """
+    b1 = make_obs("bottom", 1, 1000.0, 1000.0, area=600.0)
+    _, tx1, ty1 = calibrated_registration.project_bottom_to_top(1000.0, 1000.0)
+    t1 = make_obs("top", 1, tx1, ty1, area=600.0)
+
+    b2 = make_obs("bottom", 2, 1200.0, 1000.0, area=600.0)
+    t2 = make_obs("top", 2, 3000.0, 3000.0, area=600.0)
+
+    b_clust = make_obs("bottom", 3, 1500.0, 1500.0, area=12000.0, sep_status="under_segmented_cluster")
+    t_clust = make_obs("top", 3, 3500.0, 3500.0, area=12000.0, sep_status="under_segmented_cluster")
+
+    b_obs = [b1, b2, b_clust]
+    t_obs = [t1, t2, t_clust]
+
+    res = fusion_engine.fuse_views(b_obs, t_obs)
+
+    assert res.matched_count == 1
+    assert res.unmatched_bottom_count == 1
+    assert res.unmatched_top_count == 1
+    assert res.unresolved_cluster_count == 2
+    assert len(b_obs) == 3
+    assert len(t_obs) == 3
+
+
+# Test 14: Canonical grain totals reconcile independently
+def test_canonical_grain_totals_reconcile_independently(calibrated_registration, fusion_engine):
+    """
+    Reconcile:
+    N_single_physical = N_matched + N_unmatched_b + N_unmatched_t + N_ambiguous
+    N_total_inventory = N_single_physical + N_unresolved_clusters
+    """
+    b1 = make_obs("bottom", 1, 1000.0, 1000.0)
+    _, tx1, ty1 = calibrated_registration.project_bottom_to_top(1000.0, 1000.0)
+    t1 = make_obs("top", 1, tx1, ty1)
+
+    b2 = make_obs("bottom", 2, 200.0, 200.0)
+    t2 = make_obs("top", 2, 4500.0, 4500.0)
+
+    b_c = make_obs("bottom", 3, 500.0, 500.0, area=10000.0, sep_status="under_segmented_cluster")
+
+    b_obs = [b1, b2, b_c]
+    t_obs = [t1, t2]
+
+    res = fusion_engine.fuse_views(b_obs, t_obs)
+
+    expected_single = res.matched_count + res.unmatched_bottom_count + res.unmatched_top_count + res.ambiguous_count
+    assert res.total_single_physical_grains == expected_single
+    assert res.total_inventory_records == expected_single + res.unresolved_cluster_count
+
+
+# Test 15: Unresolved clusters are not fabricated into individual grains
+def test_unresolved_clusters_not_fabricated_into_individual_grains(fusion_engine):
+    """
+    Clusters must never be artificially decomposed into speculative grains without actual segmentation.
+    They remain segregated as cluster inventory records.
+    """
+    cluster_obs = make_obs("bottom", 999, 1000.0, 1000.0, area=15000.0, sep_status="under_segmented_cluster")
+    res = fusion_engine.fuse_views([cluster_obs], [])
+
+    assert res.total_single_physical_grains == 0
+    assert res.unresolved_cluster_count == 1
+    assert res.total_inventory_records == 1
+    cluster_grain = res.physical_grains[0]
+    assert cluster_grain.correspondence_status == CorrespondenceStatus.SEGMENTATION_UNRESOLVED
+    assert cluster_grain.quality_attributes["separation_status"] == "under_segmented_cluster"
+    assert cluster_grain.quality_attributes["is_cluster"] is True
+
+
+# Test 16: Feature flag disabled with two scanner inputs does not double-count
+def test_feature_flag_disabled_does_not_double_count(tmp_path):
+    """
+    Regression proof: when dual-view fusion is disabled, the system selects safe single-view
+    fallback and NEVER executes pd.concat across opposing platens of the same sample.
+    """
+    p1 = str(tmp_path / "p1.jpg")
+    p2 = str(tmp_path / "p2.jpg")
+
+    import cv2
+    img1 = np.full((500, 500, 3), 40, dtype=np.uint8)
+    cv2.ellipse(img1, (200, 200), (20, 8), 0, 0, 360, (220, 220, 220), -1)
+    cv2.ellipse(img1, (300, 200), (20, 8), 0, 0, 360, (220, 220, 220), -1)
+    cv2.imwrite(p1, img1)
+
+    img2 = np.full((500, 500, 3), 40, dtype=np.uint8)
+    cv2.ellipse(img2, (250, 250), (20, 8), 0, 0, 360, (220, 220, 220), -1)
+    cv2.imwrite(p2, img2)
+
+    from src.pipeline import RiceQualityPipeline
+    cfg = PipelineConfig()
+    cfg.segmentation.engine = "classic"
+    cfg.dual_view.single_view_fallback_scanner = "bottom"
+    pipeline = RiceQualityPipeline(config=cfg)
+
+    mgr = DualPlatenManager(pipeline=pipeline, use_dual_view_fusion=False)
+    res = mgr.run_dual_analysis(p1, p2, sample_id="TEST-FALLBACK")
+
+    assert res["status"] == "Complete"
+    # Bottom has 2 grains, top has 1 grain. Safe single-view fallback selects 2.
+    assert res["total_grains"] == 2
+    assert res["is_sample_doubling_prevented"] is True
+    assert res["fallback_mode"] == "SAFE_SINGLE_VIEW_SELECTION"
+
+
+# Test 17: Mass is marked as NOT_PHYSICALLY_MEASURED and statutory_acceptance_usable is False
+def test_mass_marked_unvalidated_and_not_physically_measured(calibrated_registration, fusion_engine):
+    b_obs = [make_obs("bottom", 1, 500.0, 500.0, area=600.0)]
+    t_obs = []
+
+    res = fusion_engine.fuse_views(b_obs, t_obs)
+
+    assert res.mass_measurement_status == "NOT_PHYSICALLY_MEASURED"
+    assert res.is_physically_measured is False
+    assert res.statutory_acceptance_usable is False
+    assert "unvalidated" in res.statutory_mass_disclaimer.lower() or "uncalibrated" in res.statutory_mass_disclaimer.lower()
+
+
+# Test 18: Unvalidated mass cannot drive statutory acceptance or PASS/FAIL disposition
+def test_unvalidated_mass_cannot_drive_statutory_acceptance(calibrated_registration, fusion_engine):
+    """
+    Ensure the prototype's grading and commercial disposition are based exclusively
+    on whole-grain count percentage and not on optical mass proxies.
+    """
+    b_obs = [
+        make_obs("bottom", 1, 500.0, 500.0, dclass="Good / Head Rice"),
+        make_obs("bottom", 2, 600.0, 500.0, dclass="Big Brokens (25-75%)"),
+        make_obs("bottom", 3, 700.0, 500.0, dclass="Big Brokens (25-75%)"),
+        make_obs("bottom", 4, 800.0, 500.0, dclass="Big Brokens (25-75%)"),
+    ]
+    res = fusion_engine.fuse_views(b_obs, [])
+
+    assert res.statutory_acceptance_usable is False
+    cb = res.aggregation_summary["count_basis"]
+    assert cb["whole_pct"] == 25.0
+
+
+# Test 19: Per-view defect predictions remain available after fusion
+def test_per_view_defect_predictions_remain_available(calibrated_registration, fusion_engine):
+    bx, by = 500.0, 500.0
+    _, tx, ty = calibrated_registration.project_bottom_to_top(bx, by)
+
+    b_obs = [make_obs("bottom", 1, bx, by, dclass="Good / Head Rice", dconf=0.92)]
+    t_obs = [make_obs("top", 1, tx, ty, dclass="Chalky Grains", dconf=0.88)]
+
+    res = fusion_engine.fuse_views(b_obs, t_obs)
+
+    assert len(res.physical_grains) == 1
+    g = res.physical_grains[0]
+
+    assert g.correspondence_status == CorrespondenceStatus.MATCHED
+    assert g.bottom_predicted_class == "Good / Head Rice"
+    assert g.bottom_confidence == 0.92
+    assert g.top_predicted_class == "Chalky Grains"
+    assert g.top_confidence == 0.88
+    assert g.quality_attributes["defect_class"] == "Chalky Grains"
+
+
+# Test 20: Fusion rule and version are recorded in quality_attributes
+def test_fusion_rule_and_version_recorded_in_quality_attributes(calibrated_registration, fusion_engine):
+    bx, by = 500.0, 500.0
+    _, tx, ty = calibrated_registration.project_bottom_to_top(bx, by)
+
+    b_obs = [make_obs("bottom", 1, bx, by, dclass="Good / Head Rice")]
+    t_obs = [make_obs("top", 1, tx, ty, dclass="Damaged Grains")]
+
+    res = fusion_engine.fuse_views(b_obs, t_obs)
+
+    g = res.physical_grains[0]
+    qa = g.quality_attributes
+
+    assert "fusion_rule" in qa
+    assert qa["fusion_rule"] == "surface_defect_precedence"
+    assert "fusion_rule_version" in qa
+    assert "fusion_status" in qa
+    assert qa["fusion_status"] == "AUTOMATIC"
+    assert "defect_precedence_is_standard_approved" in qa
+    assert qa["defect_precedence_is_standard_approved"] is False

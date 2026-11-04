@@ -78,6 +78,22 @@ class PhysicalGrain:
     def has_top(self) -> bool:
         return self.top_obs is not None
 
+    @property
+    def bottom_predicted_class(self) -> Optional[str]:
+        return self.quality_attributes.get("bottom_predicted_class")
+
+    @property
+    def bottom_confidence(self) -> Optional[float]:
+        return self.quality_attributes.get("bottom_confidence")
+
+    @property
+    def top_predicted_class(self) -> Optional[str]:
+        return self.quality_attributes.get("top_predicted_class")
+
+    @property
+    def top_confidence(self) -> Optional[float]:
+        return self.quality_attributes.get("top_confidence")
+
     def to_dict(self) -> Dict[str, Any]:
         res = {
             "physical_grain_id": self.physical_grain_id,
@@ -97,23 +113,37 @@ class PhysicalGrain:
 class DualViewFusionResult:
     """
     Consolidated container for the dual-view prototype output.
+    Enforces strict distinction between single physical grains, multi-grain clusters,
+    and unvalidated optical mass proxies.
     """
     physical_grains: List[PhysicalGrain]
-    total_physical_grains: int
-    matched_count: int
+    total_physical_grains: int  # Total individual physical grain candidates
+    total_single_physical_grains: int  # Strictly single grain candidates (excluding cluster blobs)
+    total_inventory_records: int  # Total canonical records in dataset (single grains + clusters)
+    matched_count: int  # Verified 1-to-1 dual-view pairs
     unmatched_bottom_count: int
     unmatched_top_count: int
     ambiguous_count: int
     registration_failed_count: int
-    unresolved_cluster_count: int
+    unresolved_cluster_count: int  # Multi-grain clusters segregated from single grains
     estimated_mass_g: float
+    estimated_optical_mass_unvalidated_g: float
     is_experimental: bool = True
+    mass_measurement_status: str = "NOT_PHYSICALLY_MEASURED"
+    is_physically_measured: bool = False
+    statutory_acceptance_usable: bool = False
+    statutory_mass_disclaimer: str = (
+        "Optical mass is an uncalibrated geometric proxy. Prohibited from statutory "
+        "procurement, tender acceptance, or legal trade decisions without physical balance verification."
+    )
     registration_metadata: Dict[str, Any] = field(default_factory=dict)
     aggregation_summary: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "total_physical_grains": self.total_physical_grains,
+            "total_single_physical_grains": self.total_single_physical_grains,
+            "total_inventory_records": self.total_inventory_records,
             "matched_count": self.matched_count,
             "unmatched_bottom_count": self.unmatched_bottom_count,
             "unmatched_top_count": self.unmatched_top_count,
@@ -121,6 +151,11 @@ class DualViewFusionResult:
             "registration_failed_count": self.registration_failed_count,
             "unresolved_cluster_count": self.unresolved_cluster_count,
             "estimated_mass_g": round(self.estimated_mass_g, 4),
+            "estimated_optical_mass_unvalidated_g": round(self.estimated_optical_mass_unvalidated_g, 4),
+            "mass_measurement_status": self.mass_measurement_status,
+            "is_physically_measured": self.is_physically_measured,
+            "statutory_acceptance_usable": self.statutory_acceptance_usable,
+            "statutory_mass_disclaimer": self.statutory_mass_disclaimer,
             "is_experimental": self.is_experimental,
             "registration_metadata": self.registration_metadata,
             "aggregation_summary": self.aggregation_summary,

@@ -2,6 +2,7 @@
 Dual-View Fusion and Aggregation Engine.
 Merges matched and unmatched ViewObservation instances into canonical PhysicalGrain records,
 enforces agronomic defect precedence, and executes non-duplicating sample-level aggregation.
+Hardened in Phase 4.1 with explicit defect fusion governance, traceability, and unvalidated mass safeguards.
 """
 
 from typing import List, Dict, Any, Optional, Tuple
@@ -81,12 +82,12 @@ class DualViewFusionEngine:
     Fuses cross-view observations into canonical physical grains.
     Enforces:
       - Canonical grain identity: 1 physical grain = 1 record.
-      - Agronomic defect precedence: surface defect visible on either side marks grain as defective.
-      - Non-duplicating mass aggregation: mass estimated once per physical grain.
+      - Configurable defect precedence: traceable per-view defect predictions.
+      - Safe unvalidated mass governance: mass explicitly marked as not physically measured.
       - Safe handling of ambiguous, failed, and unresolved cluster records.
     """
 
-    DEFECT_SEVERITY_ORDER = [
+    DEFAULT_DEFECT_SEVERITY_ORDER = [
         "Foreign Matter",
         "Damaged Grains",
         "Discoloured Grains",
@@ -100,11 +101,19 @@ class DualViewFusionEngine:
         self,
         correspondence_engine: DualViewCorrespondenceEngine,
         pixel_scale_mm: float = 0.08467,  # Default for 300 DPI (25.4 / 300)
-        mass_conversion_factor: Optional[float] = None
+        mass_conversion_factor: Optional[float] = None,
+        defect_fusion_rule: str = "surface_defect_precedence",
+        defect_fusion_version: str = "1.0.0-experimental",
+        defect_severity_order: Optional[List[str]] = None,
+        defect_precedence_is_standard_approved: bool = False
     ):
         self.correspondence_engine = correspondence_engine
         self.pixel_scale_mm = pixel_scale_mm
         self.mass_conv_factor = mass_conversion_factor
+        self.defect_fusion_rule = defect_fusion_rule
+        self.defect_fusion_version = defect_fusion_version
+        self.defect_severity_order = list(defect_severity_order) if defect_severity_order is not None else self.DEFAULT_DEFECT_SEVERITY_ORDER
+        self.defect_precedence_is_standard_approved = defect_precedence_is_standard_approved
 
     def fuse_views(
         self,
@@ -143,7 +152,7 @@ class DualViewFusionEngine:
                     "matching_algorithm": "Hungarian_Bipartite",
                     "reprojection_distance_px": m.get("distance_px"),
                     "cost_components": cost_comps,
-                    "fusion_policy": "agronomic_defect_precedence"
+                    "fusion_policy": self.defect_fusion_rule
                 }
             elif status == CorrespondenceStatus.UNMATCHED_BOTTOM:
                 unmatched_b_cnt += 1
@@ -189,9 +198,15 @@ class DualViewFusionEngine:
         # Aggregate sample-level metrics across canonical physical grains
         agg_summary, total_mass_g = self._aggregate_physical_sample(physical_grains)
 
+        # Reconcile separate counts: single grains vs clusters vs total inventory records
+        total_single_physical_grains = matched_cnt + unmatched_b_cnt + unmatched_t_cnt + ambiguous_cnt
+        total_inventory_records = len(physical_grains)
+
         return DualViewFusionResult(
             physical_grains=physical_grains,
-            total_physical_grains=len(physical_grains),
+            total_physical_grains=total_single_physical_grains,
+            total_single_physical_grains=total_single_physical_grains,
+            total_inventory_records=total_inventory_records,
             matched_count=matched_cnt,
             unmatched_bottom_count=unmatched_b_cnt,
             unmatched_top_count=unmatched_t_cnt,
@@ -199,6 +214,10 @@ class DualViewFusionEngine:
             registration_failed_count=reg_failed_cnt,
             unresolved_cluster_count=unresolved_cluster_cnt,
             estimated_mass_g=total_mass_g,
+            estimated_optical_mass_unvalidated_g=total_mass_g,
+            mass_measurement_status="NOT_PHYSICALLY_MEASURED",
+            is_physically_measured=False,
+            statutory_acceptance_usable=False,
             is_experimental=True,
             registration_metadata=self.correspondence_engine.registration.get_health_report(),
             aggregation_summary=agg_summary
@@ -207,9 +226,8 @@ class DualViewFusionEngine:
     def _fuse_matched_quality(self, b_obs: ViewObservation, t_obs: ViewObservation) -> Dict[str, Any]:
         """
         Fuses quality attributes for a confirmed one-to-one matched grain pair.
-        Implements agronomic defect precedence: defect visible on either side classifies grain.
+        Implements configurable defect precedence with full provenance and traceability.
         """
-        # 1. Defect class precedence
         b_class = b_obs.defect_class
         t_class = t_obs.defect_class
 
@@ -218,9 +236,8 @@ class DualViewFusionEngine:
             fused_conf = float(np.mean([b_obs.defect_confidence, t_obs.defect_confidence]))
             defect_source = "both_views_agree"
         else:
-            # Select higher severity defect according to agronomic inspection standard
-            b_rank = self.DEFECT_SEVERITY_ORDER.index(b_class) if b_class in self.DEFECT_SEVERITY_ORDER else 99
-            t_rank = self.DEFECT_SEVERITY_ORDER.index(t_class) if t_class in self.DEFECT_SEVERITY_ORDER else 99
+            b_rank = self.defect_severity_order.index(b_class) if b_class in self.defect_severity_order else 99
+            t_rank = self.defect_severity_order.index(t_class) if t_class in self.defect_severity_order else 99
             if b_rank <= t_rank:
                 fused_class = b_class
                 fused_conf = b_obs.defect_confidence
@@ -230,38 +247,59 @@ class DualViewFusionEngine:
                 fused_conf = t_obs.defect_confidence
                 defect_source = "top_view_defect_precedence"
 
-        # 2. Geometric attributes (average of both views for stable metric sizing)
+        # Geometric attributes
         fused_len_mm = float(np.mean([b_obs.length_mm, t_obs.length_mm]))
         fused_wid_mm = float(np.mean([b_obs.width_mm, t_obs.width_mm]))
         fused_area_px = float(np.mean([b_obs.area_px, t_obs.area_px]))
         fused_aspect_ratio = round(fused_len_mm / max(fused_wid_mm, 0.01), 2)
         is_broken = bool(b_obs.is_broken or t_obs.is_broken or "Broken" in fused_class)
 
-        # 3. Single mass calculation (NO DOUBLING!)
+        # Single mass calculation (uncalibrated optical proxy)
         mass_g = self._calculate_single_grain_mass(fused_area_px, fused_len_mm, fused_wid_mm)
 
         return {
+            "bottom_predicted_class": b_class,
+            "bottom_confidence": round(b_obs.defect_confidence, 4),
+            "top_predicted_class": t_class,
+            "top_confidence": round(t_obs.defect_confidence, 4),
+            "fused_class": fused_class,
             "defect_class": fused_class,
             "defect_confidence": round(fused_conf, 4),
             "defect_precedence_source": defect_source,
+            "fusion_rule": self.defect_fusion_rule,
+            "fusion_rule_version": self.defect_fusion_version,
+            "fusion_applied": True,
+            "fusion_status": "AUTOMATIC",
+            "defect_precedence_is_standard_approved": self.defect_precedence_is_standard_approved,
+            "precedence_standard_notice": (
+                "Approved statutory standard" if self.defect_precedence_is_standard_approved
+                else "Experimental engineering heuristic; not an approved statutory APSCSCL standard"
+            ),
             "is_broken": is_broken,
             "length_mm": round(fused_len_mm, 2),
             "width_mm": round(fused_wid_mm, 2),
             "area_px": round(fused_area_px, 1),
             "aspect_ratio": fused_aspect_ratio,
             "estimated_mass_g": round(mass_g, 5),
-            "is_fused": True,
-            "bottom_prediction": b_class,
-            "top_prediction": t_class
+            "is_fused": True
         }
 
     def _extract_single_view_quality(self, obs: ViewObservation, view: str) -> Dict[str, Any]:
         """Extracts quality attributes for an unmatched grain observed on one platen only."""
         mass_g = self._calculate_single_grain_mass(obs.area_px, obs.length_mm, obs.width_mm)
         return {
+            "bottom_predicted_class": obs.defect_class if view == "bottom" else None,
+            "bottom_confidence": round(obs.defect_confidence, 4) if view == "bottom" else None,
+            "top_predicted_class": obs.defect_class if view == "top" else None,
+            "top_confidence": round(obs.defect_confidence, 4) if view == "top" else None,
+            "fused_class": obs.defect_class,
             "defect_class": obs.defect_class,
             "defect_confidence": round(obs.defect_confidence, 4),
             "defect_precedence_source": f"single_view_{view}",
+            "fusion_rule": "none_single_view",
+            "fusion_rule_version": self.defect_fusion_version,
+            "fusion_applied": False,
+            "fusion_status": "WITHHELD",
             "is_broken": obs.is_broken,
             "length_mm": round(obs.length_mm, 2),
             "width_mm": round(obs.width_mm, 2),
@@ -272,17 +310,35 @@ class DualViewFusionEngine:
             "view_present": view
         }
 
-    def _handle_unfused_record(self, obs: Optional[ViewObservation], status: CorrespondenceStatus, reason: Optional[str]) -> Dict[str, Any]:
-        """Preserves record without automatic fusion for ambiguous/unresolved/failed cases."""
+    def _handle_unfused_record(
+        self,
+        obs: Optional[ViewObservation],
+        status: CorrespondenceStatus,
+        reason: Optional[str]
+    ) -> Dict[str, Any]:
+        """Preserves record with automatic fusion strictly disabled for ambiguous/unresolved/failed cases."""
         area = obs.area_px if obs else 0.0
         len_mm = obs.length_mm if obs else 0.0
         wid_mm = obs.width_mm if obs else 0.0
         mass_g = self._calculate_single_grain_mass(area, len_mm, wid_mm) if obs else 0.0
 
+        is_bottom = bool(obs and obs.scanner_id == "bottom")
+        is_top = bool(obs and obs.scanner_id == "top")
+
         return {
+            "bottom_predicted_class": obs.defect_class if is_bottom else None,
+            "bottom_confidence": round(obs.defect_confidence, 4) if is_bottom else None,
+            "top_predicted_class": obs.defect_class if is_top else None,
+            "top_confidence": round(obs.defect_confidence, 4) if is_top else None,
+            "fused_class": None,
             "defect_class": "Unresolved / Pending Review",
             "defect_confidence": 0.0,
             "defect_precedence_source": "none",
+            "fusion_rule": "none_withheld",
+            "fusion_rule_version": self.defect_fusion_version,
+            "fusion_applied": False,
+            "fusion_status": "WITHHELD",
+            "unfused_reason": reason or status.value,
             "is_broken": False,
             "length_mm": round(len_mm, 2),
             "width_mm": round(wid_mm, 2),
@@ -290,7 +346,8 @@ class DualViewFusionEngine:
             "aspect_ratio": round(len_mm / max(wid_mm, 0.01), 2) if wid_mm > 0 else 0.0,
             "estimated_mass_g": round(mass_g, 5),
             "is_fused": False,
-            "unfused_reason": reason or status.value
+            "is_cluster": status == CorrespondenceStatus.SEGMENTATION_UNRESOLVED,
+            "separation_status": obs.raw_features.get("separation_status", "under_segmented_cluster" if status == CorrespondenceStatus.SEGMENTATION_UNRESOLVED else "single_grain") if obs else "unknown"
         }
 
     def _calculate_single_grain_mass(self, area_px: float, length_mm: float, width_mm: float) -> float:
@@ -374,8 +431,14 @@ class DualViewFusionEngine:
 
         mass_basis = {
             "total_estimated_mass_g": round(total_sample_mass_g, 4),
-            "is_measured_scale_mass": False,
-            "mass_estimation_type": "Volumetric Optical Proxy (Unvalidated for Statutory Trade)",
+            "total_estimated_mass_unvalidated_g": round(total_sample_mass_g, 4),
+            "mass_measurement_status": "NOT_PHYSICALLY_MEASURED",
+            "is_physically_measured": False,
+            "statutory_acceptance_usable": False,
+            "statutory_mass_disclaimer": (
+                "Optical mass is an uncalibrated geometric proxy. Prohibited from statutory "
+                "procurement, tender acceptance, or legal trade decisions without physical balance verification."
+            ),
             "whole_mass_g": round(category_masses["Good / Head Rice"], 4),
             "whole_pct": round(category_masses["Good / Head Rice"] / denom_mass * 100, 2),
             "broken_mass_g": round(category_masses["Big Brokens (25-75%)"], 4),
@@ -408,6 +471,14 @@ class DualViewFusionEngine:
         summary = {
             "total_physical_grains": total_physical_count,
             "total_estimated_mass_g": round(total_sample_mass_g, 4),
+            "total_estimated_mass_unvalidated_g": round(total_sample_mass_g, 4),
+            "mass_measurement_status": "NOT_PHYSICALLY_MEASURED",
+            "is_physically_measured": False,
+            "statutory_acceptance_usable": False,
+            "statutory_mass_disclaimer": (
+                "Optical mass is an uncalibrated geometric proxy. Prohibited from statutory "
+                "procurement, tender acceptance, or legal trade decisions without physical balance verification."
+            ),
             "avg_length_mm": round(avg_len, 2),
             "avg_breadth_mm": round(avg_brd, 2),
             "length_breadth_ratio": round(avg_len / max(avg_brd, 0.01), 2),

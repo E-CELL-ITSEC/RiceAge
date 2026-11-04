@@ -237,6 +237,11 @@ class DualPlatenManager:
             max_d = dv_cfg.max_matching_distance_px if dv_cfg else 35.0
             amb_delta = dv_cfg.ambiguity_delta_px if dv_cfg else 8.0
 
+            f_rule = dv_cfg.defect_fusion_rule if dv_cfg and hasattr(dv_cfg, "defect_fusion_rule") else "surface_defect_precedence"
+            f_ver = dv_cfg.defect_fusion_version if dv_cfg and hasattr(dv_cfg, "defect_fusion_version") else "1.0.0-experimental"
+            f_order = list(dv_cfg.defect_severity_order) if dv_cfg and hasattr(dv_cfg, "defect_severity_order") else None
+            f_appr = dv_cfg.defect_precedence_is_standard_approved if dv_cfg and hasattr(dv_cfg, "defect_precedence_is_standard_approved") else False
+
             reg = DualViewRegistration(homography_matrix=H_mat)
             corr_engine = DualViewCorrespondenceEngine(
                 registration=reg,
@@ -245,7 +250,11 @@ class DualPlatenManager:
             )
             fusion_engine = DualViewFusionEngine(
                 correspondence_engine=corr_engine,
-                pixel_scale_mm=pixel_scale
+                pixel_scale_mm=pixel_scale,
+                defect_fusion_rule=f_rule,
+                defect_fusion_version=f_ver,
+                defect_severity_order=f_order,
+                defect_precedence_is_standard_approved=f_appr
             )
 
             fusion_result = fusion_engine.fuse_views(obs_b, obs_t)
@@ -290,9 +299,16 @@ class DualPlatenManager:
                 "sample_id": sample_id,
                 "timestamp": int(time.time()),
                 "timestamp_str": time.strftime("%d/%m/%Y %H:%M:%S"),
-                "total_objects": fusion_result.total_physical_grains,
-                "total_grains": fusion_result.total_physical_grains,
+                "total_objects": fusion_result.total_inventory_records,
+                "total_grains": fusion_result.total_single_physical_grains,
+                "total_single_physical_grains": fusion_result.total_single_physical_grains,
+                "total_inventory_records": fusion_result.total_inventory_records,
                 "total_sample_mass_g": fusion_result.estimated_mass_g,
+                "estimated_optical_mass_unvalidated_g": fusion_result.estimated_optical_mass_unvalidated_g,
+                "mass_measurement_status": fusion_result.mass_measurement_status,
+                "is_physically_measured": fusion_result.is_physically_measured,
+                "statutory_acceptance_usable": fusion_result.statutory_acceptance_usable,
+                "statutory_mass_disclaimer": fusion_result.statutory_mass_disclaimer,
                 "avg_length_mm": agg["avg_length_mm"],
                 "avg_breadth_mm": agg["avg_breadth_mm"],
                 "length_breadth_ratio": agg["length_breadth_ratio"],
@@ -317,12 +333,27 @@ class DualPlatenManager:
                 "composite_image": os.path.basename(composite_output_path) if composite_output_path else ""
             }
 
-        # 4. Legacy Pipeline: Merge Grain Measurements into Single Unified Dataset
-        if dfs:
-            df_unified = pd.concat(dfs, ignore_index=True)
-            df_unified["grain_id"] = list(range(1, len(df_unified) + 1))
+        # 4. Safe Single-View Fallback Pipeline (when dual-view fusion is disabled)
+        # NEVER concatenate both platen scans as independent grains for the same physical sample!
+        fallback_scanner = "bottom"
+        if self.pipeline and getattr(self.pipeline.config, "dual_view", None):
+            fallback_scanner = getattr(self.pipeline.config.dual_view, "single_view_fallback_scanner", "bottom")
+
+        if len(dfs) > 1 and "bottom" in platens_info and "top" in platens_info:
+            print(f"[DualPlatenManager] Dual-view fusion disabled. Safe Fallback Active: selecting primary '{fallback_scanner}' platen only to prevent physical sample double-counting.")
+            df_unified = df_b.copy() if fallback_scanner == "bottom" and df_b is not None else (df_t.copy() if df_t is not None else dfs[0].copy())
+            fallback_mode = "SAFE_SINGLE_VIEW_SELECTION"
+            is_sample_doubling_prevented = True
+        elif dfs:
+            df_unified = dfs[0].copy()
+            fallback_mode = "GENUINE_SINGLE_SCANNER"
+            is_sample_doubling_prevented = True
         else:
             df_unified = pd.DataFrame()
+            fallback_mode = "EMPTY"
+            is_sample_doubling_prevented = True
+
+        df_unified["grain_id"] = list(range(1, len(df_unified) + 1))
 
         # Calibration pixel scale
         calib_scale = None
@@ -363,9 +394,21 @@ class DualPlatenManager:
                 "status": "acceptable" if "Min" in s["limit"] and s["mass_pct"] >= float(s["limit"].replace("Min ", "").replace("%", "")) or ("Max" in s["limit"] and s["mass_pct"] <= float(s["limit"].replace("Max ", "").replace("%", ""))) else "substandard"
             })
 
+        # Mark unvalidated mass disclaimer on legacy output
+        mb["mass_measurement_status"] = "NOT_PHYSICALLY_MEASURED"
+        mb["is_physically_measured"] = False
+        mb["statutory_acceptance_usable"] = False
+        mb["statutory_mass_disclaimer"] = "Optical mass is an uncalibrated geometric proxy. Prohibited from statutory procurement without physical balance verification."
+        mb["total_estimated_mass_unvalidated_g"] = mb.get("total_mass_g", 0.0)
+
         return {
             "status": "Complete",
             "commodity": commodity,
+            "fallback_mode": fallback_mode,
+            "is_sample_doubling_prevented": is_sample_doubling_prevented,
+            "mass_measurement_status": "NOT_PHYSICALLY_MEASURED",
+            "is_physically_measured": False,
+            "statutory_acceptance_usable": False,
             "serial": sample_id,
             "sample_id": sample_id,
             "timestamp": int(time.time()),

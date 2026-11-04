@@ -106,6 +106,21 @@ class DualViewConfig:
     min_scale: float = 0.95
     max_scale: float = 1.05
     max_reprojection_rmse_px: float = 8.0
+    # Safe Single-View Fallback Configuration (when dual_view is disabled)
+    single_view_fallback_scanner: str = "bottom"  # "bottom" or "top"
+    # Defect Fusion Governance & Traceability
+    defect_fusion_rule: str = "surface_defect_precedence"
+    defect_fusion_version: str = "1.0.0-experimental"
+    defect_precedence_is_standard_approved: bool = False
+    defect_severity_order: Tuple[str, ...] = (
+        "Foreign Matter",
+        "Damaged Grains",
+        "Discoloured Grains",
+        "Small Brokens (<25%)",
+        "Big Brokens (25-75%)",
+        "Chalky Grains",
+        "Good / Head Rice"
+    )
 
 
 @dataclass
