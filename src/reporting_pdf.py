@@ -132,12 +132,12 @@ def generate_apscscl_pdf_certificate(
 
     # 1. Official Header
     story.append(Paragraph("ANDHRA PRADESH STATE CIVIL SUPPLIES CORPORATION LIMITED", title_style))
-    story.append(Paragraph("(A Government of Andhra Pradesh Undertaking) — Central Quality Control Directorate", subtitle_style))
-    story.append(Spacer(1, 4))
+    story.append(Paragraph("(A Government of Andhra Pradesh Undertaking) — Central Quality Control Directorate<br/><font size=7 color='#6c757d'>Automated Optical Multi-Attribute Evaluation — Pre-Inspection / Advisory Only (Non-Certified Prototype)</font>", subtitle_style))
+    story.append(Spacer(1, 3))
 
     # Header Ribbon
     header_table = Table(
-        [[Paragraph("DIGITAL RICE QUALITY ANALYSIS CERTIFICATE", banner_style)]],
+        [[Paragraph("DIGITAL RICE QUALITY ANALYSIS REPORT (PRE-INSPECTION / EXPERIMENTAL PROTOTYPE)", banner_style)]],
         colWidths=[539],
         rowHeights=[20]
     )
@@ -169,7 +169,7 @@ def generate_apscscl_pdf_certificate(
         [Paragraph("Analysis Date / Time:", table_cell_bold), Paragraph(str(timestamp_str), table_cell)],
     ]
     meta_right = [
-        [Paragraph("Sample Analyzed Mass:", table_cell_bold), Paragraph(f"<b>{tot_mass:.2f} g</b> (nominal 5.00 g)", table_cell)],
+        [Paragraph("Sample Analyzed Mass:", table_cell_bold), Paragraph(f"<b>{tot_mass:.2f} g*</b> (NOT PHYSICALLY MEASURED)", table_cell)],
         [Paragraph("Total Grains Counted:", table_cell_bold), Paragraph(f"<b>{tot_grains} kernels</b>", table_cell)],
         [Paragraph("Avg Grain Dimensions:", table_cell_bold), Paragraph(f"L: {avg_len:.2f} mm | W: {avg_brd:.2f} mm", table_cell)],
         [Paragraph("Grain Shape (L/B Ratio):", table_cell_bold), Paragraph(f"{lb_ratio:.2f} ({grain_type})", table_cell)],
@@ -194,7 +194,17 @@ def generate_apscscl_pdf_certificate(
         ("RIGHTPADDING", (0, 0), (-1, -1), 6),
     ]))
     story.append(meta_container)
-    story.append(Spacer(1, 6))
+    mass_disclaimer_style = ParagraphStyle(
+        "MassDisclaimer",
+        parent=styles["Normal"],
+        fontName="Helvetica-Oblique",
+        fontSize=6.5,
+        leading=8,
+        textColor=colors.HexColor("#6c757d"),
+        alignment=1
+    )
+    story.append(Paragraph("*Sample mass is an uncalibrated optical proxy (NOT_PHYSICALLY_MEASURED). Statutory procurement grading suspended until physical load cell integrated. Count-basis metrics preserved.", mass_disclaimer_style))
+    story.append(Spacer(1, 4))
 
     # 3. Main Quality Refraction Analysis Table (Count vs Mass % w/w)
     mb = analysis_data.get("mass_basis", {})
@@ -234,7 +244,10 @@ def generate_apscscl_pdf_certificate(
         if not passed:
             all_comply = False
 
-        status_txt = f"<font color='{'#198754' if passed else '#DC3545'}'><b>{'PASS' if passed else 'FAIL'}</b></font>"
+        if sn == "9":
+            status_txt = "<font color='#0D6EFD'><b>REQUIRES LAB<br/>CONFIRMATION</b></font>"
+        else:
+            status_txt = f"<font color='{'#198754' if passed else '#DC3545'}'><b>{'PASS' if passed else 'FLAG'}</b></font>"
 
         row = [
             Paragraph(sn, table_cell_center),
@@ -304,10 +317,10 @@ def generate_apscscl_pdf_certificate(
         rl_overlay = Paragraph("<b>OPTICAL PLATEN SCAN VERIFIED</b><br/><font size=6 color='#666'>Dual Canon CanoScan LiDE 400 Sequential Optical Capture<br/>Lossless Grain Instance Mapping @ Verified Optical Resolution</font>", table_cell_center)
 
     sign_box = Paragraph(
-        "<b>AUTHORIZED QUALITY VERIFIER</b><br/>"
-        "<font size=6 color='#555'>Digitally Certified by:<br/>"
+        "<b>PRE-INSPECTION ADVISORY ONLY</b><br/>"
+        "<font size=5.5 color='#555'>Non-Certified Prototype Report<br/>"
         "APSCSCL Central Quality Lab Station<br/>"
-        "AI-Based Multimodal Analyzer M5.0<br/>"
+        "Physical balance & lab confirmation required for statutory procurement.<br/>"
         "Security Hash: " + hashlib.sha256(qr_data.encode()).hexdigest()[:12] + "</font>",
         body_style
     )

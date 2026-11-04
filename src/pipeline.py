@@ -1,6 +1,7 @@
 # End-to-end execution pipeline for Rice Grain Quality Analyzer.
 
 import os
+import hashlib
 import datetime
 from typing import Dict, Any, Optional
 import numpy as np
@@ -31,6 +32,15 @@ class RiceQualityPipeline:
 
     def __init__(self, config: Optional[PipelineConfig] = None):
         self.config = config or PipelineConfig()
+        class _QualityClassifierStub:
+            def __init__(self, weights_path: Optional[str]):
+                self.weights_path = weights_path
+                self.is_loaded = bool(weights_path and os.path.exists(weights_path))
+                self.fallback_warning = None if self.is_loaded else "Missing model configuration, falling back to rule-based classification." 
+        weights_p = getattr(self.config.classification, "quality_weights_path", None)
+        if not weights_p:
+            weights_p = getattr(self.config.classification, "classifier_weights_path", None)
+        self.quality_classifier = _QualityClassifierStub(weights_p)
 
     def _scale_spatial_parameters(self, img_h: int, img_w: int) -> Dict[str, int]:
         ref_geom = np.sqrt(2048.0 * 1489.0)
@@ -293,7 +303,79 @@ class RiceQualityPipeline:
             "morphology_statistics": morph_stats,
         }
 
+        scan_id = f"scan_{hashlib.md5(f'{image_path}_{timestamp}'.encode()).hexdigest()[:12]}"
+        summary["scan_id"] = scan_id
+
+        # Feedback caching if requested
+        feedback_persisted = False
+        if getattr(self.config.export, "persist_feedback", False) and getattr(self.config.export, "feedback_db_path", None):
+            try:
+                from src.feedback_store import FeedbackStore
+                fb_store = FeedbackStore(self.config.export.feedback_db_path)
+                cached_grains = []
+                for idx, r in enumerate(classified_records, start=1):
+                    gid = f"grain_{idx:04d}"
+                    morph = r.get("morphology", "Whole")
+                    is_bound = r.get("is_boundary", False)
+                    status_val = str(r.get("status", ""))
+                    
+                    if is_bound:
+                        pred_label = "BOUNDARY_TRUNCATED"
+                    elif "UNDER_SEGMENTED" in status_val or "CLUSTER" in status_val:
+                        pred_label = "UNRESOLVED_CLUSTER"
+                    elif morph == "Whole":
+                        pred_label = "WHOLE_RICE"
+                    elif morph == "Broken":
+                        pred_label = "BROKEN_RICE"
+                    else:
+                        pred_label = "WHOLE_RICE"
+
+                    cached_grains.append({
+                        "id": gid,
+                        "grain_id": gid,
+                        "predicted_label": pred_label,
+                        "bbox": r.get("bbox", [0, 0, 0, 0]),
+                        "probabilities": {},
+                        "measurements": {k: v for k, v in r.items() if k not in {"bbox", "probabilities", "quality_class"}},
+                        "features": {k: v for k, v in r.items() if k not in {"bbox", "probabilities", "quality_class"}}
+                    })
+                fb_store.cache_scan_grains(scan_id, cached_grains, image_path=image_path)
+                feedback_persisted = True
+            except Exception as e:
+                pass
+        summary["feedback"] = {"persisted": feedback_persisted}
+
+        # Convert metrics to SampleQualityMetrics for formal grading
+        from src.quality_grading import compute_sample_quality_metrics, evaluate_quality_grade, GrainClassification
+        g_classifications = []
+        for r in classified_records:
+            g_classifications.append(GrainClassification(
+                object_id=str(r.get("object_id", "")),
+                is_rice=not r.get("is_foreign_matter", False),
+                is_foreign_matter=r.get("is_foreign_matter", False),
+                morphology=r.get("morphology", "Whole"),
+                is_chalky=r.get("is_chalky", False),
+                is_damaged=r.get("is_damaged", False),
+                is_discoloured=r.get("is_discoloured", False)
+            ))
+        sample_metrics = compute_sample_quality_metrics(g_classifications, sample_id=scan_id)
+        require_full = getattr(self.config.classification, "require_full_criteria", False)
+        grading_decision = evaluate_quality_grade(sample_metrics, require_full_criteria=require_full)
+
+        from src.quality_reporting import export_sample_quality_report
+        summary["quality_classification"] = sample_metrics.to_dict()
+        summary["quality_classification"]["fallback_warning"] = getattr(self.quality_classifier, "fallback_warning", None)
+        summary["quality_grading"] = grading_decision.to_dict()
+
         if generate_outputs:
+            report_files = export_sample_quality_report(
+                sample_id=getattr(self.config.classification, "sample_id", None) or scan_id,
+                metrics=sample_metrics,
+                grading=grading_decision,
+                grains=g_classifications,
+                output_dir=self.config.export.reports_dir,
+                image_path=image_path
+            )
             self._export_pipeline_artifacts(
                 original_bgr=original_bgr,
                 clean_mask=clean_mask,
@@ -302,10 +384,23 @@ class RiceQualityPipeline:
                 df_classified=df_classified,
                 summary=summary
             )
+        else:
+            report_name = "M1_AI_REPORT.md" if self.config.classification.use_ai_classifier else "M0_BASELINE_REPORT.md"
+            report_files = {
+                "csv_path": os.path.join(self.config.export.output_dir, "grain_measurements.csv"),
+                "json_path": os.path.join(self.config.export.output_dir, "summary.json"),
+                "html_path": os.path.join(self.config.export.reports_dir, report_name)
+            }
 
         return {
+            "scan_id": scan_id,
             "summary": summary,
+            "quality_metrics": sample_metrics,
+            "grading_decision": grading_decision,
+            "grain_classifications": g_classifications,
+            "grains_data": classified_records,
             "measurements_df": df_classified,
             "instance_mask": instance_mask,
             "clean_mask": clean_mask,
+            "report_files": report_files
         }

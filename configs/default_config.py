@@ -134,6 +134,8 @@ class ExportConfig:
     crops_dir: str = "outputs/crops"
     masks_dir: str = "outputs/masks"
     reports_dir: str = "outputs/reports"
+    feedback_db_path: Optional[str] = None
+    persist_feedback: bool = False
 
 
 @dataclass

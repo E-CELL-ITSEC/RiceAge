@@ -568,35 +568,42 @@ def compute_quality_metrics(
         "total_sample_mass_g": round(total_mass, 4),
     }
 
-    # Grade determination based on Codex / APSCSCL Mass Basis limits
-    mb = mass_basis
-    is_grade_1 = (
-        mb["whole_pct"] >= 75.0 and
-        mb["broken_pct"] <= 15.0 and
-        mb["small_broken_pct"] <= 1.0 and
-        mb["chalky_pct"] <= 3.0 and
-        mb["damaged_pct"] <= 2.0 and
-        mb["discoloured_pct"] <= 1.0 and
-        mb["foreign_matter_pct"] <= 0.5
-    )
-    is_grade_2 = (
-        mb["whole_pct"] >= 65.0 and
-        mb["total_broken_pct"] <= 25.0 and
-        mb["damaged_pct"] <= 4.0 and
-        mb["foreign_matter_pct"] <= 1.0
+    # Explicitly mark optical mass as NOT_PHYSICALLY_MEASURED and suspend statutory mass grading
+    mass_basis["mass_measurement_status"] = "NOT_PHYSICALLY_MEASURED"
+    mass_basis["is_physically_measured"] = False
+    mass_basis["statutory_grading_suspended"] = True
+    mass_basis["statutory_mass_disclaimer"] = "Optical mass is an uncalibrated geometric proxy. Prohibited from statutory procurement grading without calibrated physical load cell."
+
+    # 3-tier pre-inspection optical screening evaluation (Advisory only; non-certified)
+    # Uses count-basis optical measurements; preserves count metrics separately
+    cb = count_basis
+    optical_meets_thresholds = (
+        cb["whole_pct"] >= 75.0 and
+        cb["broken_pct"] <= 15.0 and
+        cb["small_broken_pct"] <= 1.0 and
+        cb["chalky_pct"] <= 3.0 and
+        cb["damaged_pct"] <= 2.0 and
+        cb["discoloured_pct"] <= 1.0 and
+        cb["foreign_matter_pct"] <= 0.5
     )
 
-    if is_grade_1:
-        grade = "Grade 1 (Conforming to APSCSCL Specifications)"
-    elif is_grade_2:
-        grade = "Grade 2 (Commercial Standard)"
+    if optical_meets_thresholds:
+        screening_verdict = "PASS"
+        grade = "Grade 1 (Pre-Inspection Optical Criteria Met - Lab Confirmation Required)"
     else:
-        grade = "Sub-Standard / Out of Specification"
+        screening_verdict = "FLAG"
+        grade = "FLAG (Optical Defect Limit Exceeded - Lab Confirmation Required)"
 
     return {
         "count_basis": count_basis,
         "mass_basis": mass_basis,
         "commercial_grade": grade,
+        "screening_verdict": screening_verdict,
+        "decision_tier": screening_verdict,
+        "statutory_compliance_status": "REQUIRES_LAB_CONFIRMATION",
+        "mass_measurement_status": "NOT_PHYSICALLY_MEASURED",
+        "statutory_mass_usable": False,
+        "statutory_grading_suspended": True,
         "total_grains": total_count,
         "total_mass_g": round(total_mass, 4)
     }

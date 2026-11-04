@@ -283,12 +283,33 @@ class DualPlatenManager:
 
             rows = []
             for s in stats:
+                is_min = "Min" in s["limit"]
+                is_max = "Max" in s["limit"]
+                if is_min:
+                    try:
+                        thresh = float(s["limit"].replace("Min ", "").replace("%", ""))
+                        passes = (s["pct"] >= thresh)
+                        stat_label = "PASS" if passes else "FLAG"
+                    except ValueError:
+                        stat_label = "REQUIRES LAB CONFIRMATION"
+                elif is_max:
+                    try:
+                        thresh = float(s["limit"].replace("Max ", "").replace("%", ""))
+                        passes = (s["pct"] <= thresh)
+                        stat_label = "PASS" if passes else "FLAG"
+                    except ValueError:
+                        stat_label = "REQUIRES LAB CONFIRMATION"
+                else:
+                    stat_label = "REQUIRES LAB CONFIRMATION"
+
                 rows.append({
                     "name": s["param"],
                     "limit": s["limit"],
-                    "resultPct": f"{s['mass_pct']:.2f}% (mass) / {s['pct']:.2f}% (cnt)",
-                    "resultCountAndGms": f"{s['count']} grains ({s['mass_g']:.3f} g)",
-                    "status": "acceptable" if "Min" in s["limit"] and s["mass_pct"] >= float(s["limit"].replace("Min ", "").replace("%", "")) or ("Max" in s["limit"] and s["mass_pct"] <= float(s["limit"].replace("Max ", "").replace("%", ""))) else "substandard"
+                    "resultPct": f"{s['mass_pct']:.2f}% (mass*) / {s['pct']:.2f}% (cnt)",
+                    "resultCountAndGms": f"{s['count']} grains ({s['mass_g']:.3f} g*)",
+                    "status": stat_label,
+                    "decision_tier": stat_label,
+                    "laboratory_confirmation_required": True,
                 })
 
             return {
@@ -386,12 +407,33 @@ class DualPlatenManager:
 
         rows = []
         for s in stats:
+            is_min = "Min" in s["limit"]
+            is_max = "Max" in s["limit"]
+            if is_min:
+                try:
+                    thresh = float(s["limit"].replace("Min ", "").replace("%", ""))
+                    passes = (s["pct"] >= thresh)
+                    stat_label = "PASS" if passes else "FLAG"
+                except ValueError:
+                    stat_label = "REQUIRES LAB CONFIRMATION"
+            elif is_max:
+                try:
+                    thresh = float(s["limit"].replace("Max ", "").replace("%", ""))
+                    passes = (s["pct"] <= thresh)
+                    stat_label = "PASS" if passes else "FLAG"
+                except ValueError:
+                    stat_label = "REQUIRES LAB CONFIRMATION"
+            else:
+                stat_label = "REQUIRES LAB CONFIRMATION"
+
             rows.append({
                 "name": s["param"],
                 "limit": s["limit"],
-                "resultPct": f"{s['mass_pct']:.2f}% (mass) / {s['pct']:.2f}% (cnt)",
-                "resultCountAndGms": f"{s['count']} grains ({s['mass_g']:.3f} g)",
-                "status": "acceptable" if "Min" in s["limit"] and s["mass_pct"] >= float(s["limit"].replace("Min ", "").replace("%", "")) or ("Max" in s["limit"] and s["mass_pct"] <= float(s["limit"].replace("Max ", "").replace("%", ""))) else "substandard"
+                "resultPct": f"{s['mass_pct']:.2f}% (mass*) / {s['pct']:.2f}% (cnt)",
+                "resultCountAndGms": f"{s['count']} grains ({s['mass_g']:.3f} g*)",
+                "status": stat_label,
+                "decision_tier": stat_label,
+                "laboratory_confirmation_required": True,
             })
 
         # Mark unvalidated mass disclaimer on legacy output

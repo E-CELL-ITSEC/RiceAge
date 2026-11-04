@@ -294,8 +294,23 @@ def segment_yolo(
 
 
 # Segment image using Otsu's optimal global thresholding.
-def segment_otsu(gray_image: np.ndarray) -> Tuple[np.ndarray, float]:
+def segment_otsu(gray_image: np.ndarray, max_fg_ratio: Optional[float] = None) -> Tuple[np.ndarray, float]:
     thresh_val, binary = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if max_fg_ratio is not None and np.mean(binary > 0) > max_fg_ratio:
+        hist, bin_edges = np.histogram(gray_image, bins=256, range=(0, 256))
+        non_zero_bins = np.where(bin_edges[:-1] > 0)[0]
+        if len(non_zero_bins) > 0:
+            bg_peak = bin_edges[non_zero_bins[np.argmax(hist[non_zero_bins])]]
+            upper_pixels = gray_image[gray_image > bg_peak]
+            if len(upper_pixels) > 0 and len(np.unique(upper_pixels)) > 1:
+                try:
+                    thresh_val = float(filters.threshold_otsu(upper_pixels))
+                except Exception:
+                    thresh_val = float(bg_peak + 50.0)
+            else:
+                thresh_val = float(bg_peak + 50.0)
+            thresh_val = max(thresh_val, float(bg_peak + 50.0))
+            _, binary = cv2.threshold(gray_image, thresh_val, 255, cv2.THRESH_BINARY)
     return binary, float(thresh_val)
 
 
