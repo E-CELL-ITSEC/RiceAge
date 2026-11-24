@@ -2,12 +2,20 @@
 Dual-View Fusion and Aggregation Engine.
 Merges matched and unmatched ViewObservation instances into canonical PhysicalGrain records,
 enforces agronomic defect precedence, and executes non-duplicating sample-level aggregation.
-Hardened in Phase 4.1 with explicit defect fusion governance, traceability, and unvalidated mass safeguards.
+
+Supports:
+  - 'bottom_primary' (Authoritative Delivery Architecture): Bottom scanner is the single authoritative
+    source of truth for counts, dimensions, whole/broken, defects, and denominators. Top scanner provides
+    secondary verification and discrepancy flags only. Top detections are NEVER added to primary count.
+  - 'experimental_canonical_fusion' (Phase 4/4.1 Prototype): Preserved behind feature flag for experimental
+    symmetric research.
 """
 
+import os
 from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
 import numpy as np
+import cv2
 
 from src.dual_view.models import (
     ViewObservation,
@@ -16,6 +24,68 @@ from src.dual_view.models import (
     DualViewFusionResult
 )
 from src.dual_view.correspondence import DualViewCorrespondenceEngine
+
+
+
+def assess_image_quality(
+    image_bgr: Optional[np.ndarray],
+    min_laplacian_var: float = 8.0,
+    min_contrast: float = 12.0,
+    min_brightness: float = 15.0,
+    max_brightness: float = 240.0
+) -> Dict[str, Any]:
+    """
+    Evaluates optical sharpness, contrast, and illumination suitability of an input scan.
+    Prevents degraded/blurry secondary top images from generating false defect discrepancies.
+    """
+    if image_bgr is None or not isinstance(image_bgr, np.ndarray) or image_bgr.size == 0:
+        return {
+            "status": "NOT_VERIFIABLE",
+            "quality_tier": "UNAVAILABLE",
+            "reasons": ["Image array missing, None, or empty"],
+            "laplacian_variance": 0.0,
+            "rms_contrast": 0.0,
+            "mean_brightness": 0.0,
+            "is_suitable": False
+        }
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY) if len(image_bgr.shape) == 3 else image_bgr
+    
+    # Foreground segmentation (> 50 intensity to filter black scanner glass)
+    fg_mask = gray > 50
+    if np.sum(fg_mask) > 100:
+        eval_pixels = gray[fg_mask]
+        lap = cv2.Laplacian(gray, cv2.CV_64F)[fg_mask]
+        lap_var = float(np.var(lap))
+    else:
+        eval_pixels = gray
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    rms_contrast = float(np.std(gray))
+    mean_brightness = float(np.mean(eval_pixels))
+
+    reasons = []
+    if lap_var < min_laplacian_var:
+        reasons.append(f"Image blur / out-of-focus (Laplacian variance {lap_var:.2f} < {min_laplacian_var:.1f})")
+    if mean_brightness < min_brightness:
+        reasons.append(f"Severe underexposure / platen dark (Mean brightness {mean_brightness:.1f} < {min_brightness:.1f})")
+    if mean_brightness > max_brightness:
+        reasons.append(f"Severe overexposure / saturation (Mean brightness {mean_brightness:.1f} > {max_brightness:.1f})")
+    if rms_contrast < min_contrast:
+        reasons.append(f"Low optical contrast (RMS contrast {rms_contrast:.2f} < {min_contrast:.1f})")
+
+    is_suitable = (len(reasons) == 0)
+    status = "SUITABLE" if is_suitable else "NOT_VERIFIABLE"
+
+    return {
+        "status": status,
+        "quality_tier": "SUITABLE" if is_suitable else ("BLURRY" if lap_var < min_laplacian_var else "DEGRADED"),
+        "reasons": reasons,
+        "laplacian_variance": round(lap_var, 2),
+        "rms_contrast": round(rms_contrast, 2),
+        "mean_brightness": round(mean_brightness, 2),
+        "is_suitable": is_suitable
+    }
 
 
 def dataframe_to_view_observations(
@@ -80,11 +150,7 @@ def dataframe_to_view_observations(
 class DualViewFusionEngine:
     """
     Fuses cross-view observations into canonical physical grains.
-    Enforces:
-      - Canonical grain identity: 1 physical grain = 1 record.
-      - Configurable defect precedence: traceable per-view defect predictions.
-      - Safe unvalidated mass governance: mass explicitly marked as not physically measured.
-      - Safe handling of ambiguous, failed, and unresolved cluster records.
+    Supports both Bottom-Scanner-Primary architecture and legacy Canonical Symmetric fusion.
     """
 
     DEFAULT_DEFECT_SEVERITY_ORDER = [
@@ -105,7 +171,8 @@ class DualViewFusionEngine:
         defect_fusion_rule: str = "surface_defect_precedence",
         defect_fusion_version: str = "1.0.0-experimental",
         defect_severity_order: Optional[List[str]] = None,
-        defect_precedence_is_standard_approved: bool = False
+        defect_precedence_is_standard_approved: bool = False,
+        architecture_mode: Optional[str] = None
     ):
         self.correspondence_engine = correspondence_engine
         self.pixel_scale_mm = pixel_scale_mm
@@ -115,13 +182,440 @@ class DualViewFusionEngine:
         self.defect_severity_order = list(defect_severity_order) if defect_severity_order is not None else self.DEFAULT_DEFECT_SEVERITY_ORDER
         self.defect_precedence_is_standard_approved = defect_precedence_is_standard_approved
 
+        env_mode = os.environ.get("RICEAGE_DUAL_VIEW_MODE", "").strip().lower()
+        if env_mode in ("canonical_fusion", "symmetric", "experimental", "mode_b"):
+            raise ValueError(
+                "Symmetric dual-view fusion (Mode B) is strictly prohibited from production "
+                "to prevent +78% grain count inflation and statutory non-compliance. "
+                "Supported modes: 'single_view' or 'bottom_primary_verification'."
+            )
+
+        if architecture_mode is not None:
+            clean = architecture_mode.strip().lower()
+            if clean in ("bottom_primary_verification", "mode_c", "verification"):
+                self.architecture_mode = "bottom_primary_verification"
+            elif clean in ("bottom_primary", "single_view", "single"):
+                self.architecture_mode = "bottom_primary"
+            elif clean in ("experimental_canonical_fusion", "canonical_fusion", "symmetric"):
+                # Preserved for unit test regression only; prohibited in production deployment
+                self.architecture_mode = "experimental_canonical_fusion"
+            else:
+                self.architecture_mode = "bottom_primary"
+        elif env_mode in ("bottom_primary_verification", "mode_c", "verification"):
+            self.architecture_mode = "bottom_primary_verification"
+        else:
+            self.architecture_mode = "bottom_primary"
+
     def fuse_views(
+        self,
+        bottom_obs: List[ViewObservation],
+        top_obs: List[ViewObservation],
+        top_quality_status: str = "SUITABLE",
+        top_quality_metrics: Optional[Dict[str, Any]] = None
+    ) -> DualViewFusionResult:
+        """
+        Executes correspondence matching and routes to the active architectural mode.
+        If top_quality_status is NOT_VERIFIABLE, top view observations cannot be used to verify bottom predictions.
+        """
+        if self.architecture_mode in ("bottom_primary", "bottom_primary_verification", "single_view"):
+            return self._fuse_views_bottom_primary(
+                bottom_obs,
+                top_obs,
+                top_quality_status=top_quality_status,
+                top_quality_metrics=top_quality_metrics
+            )
+        elif self.architecture_mode == "experimental_canonical_fusion":
+            return self._fuse_views_canonical_symmetric(bottom_obs, top_obs)
+        else:
+            raise ValueError(
+                f"Architecture mode '{self.architecture_mode}' is prohibited from production. "
+                "Supported modes: 'single_view' or 'bottom_primary_verification'."
+            )
+
+    def _fuse_views_bottom_primary(
+        self,
+        bottom_obs: List[ViewObservation],
+        top_obs: List[ViewObservation],
+        top_quality_status: str = "SUITABLE",
+        top_quality_metrics: Optional[Dict[str, Any]] = None
+    ) -> DualViewFusionResult:
+        """
+        Executes Bottom-Scanner-Primary Analysis.
+        The bottom scanner is the single authoritative source of truth for:
+          - Grain count
+          - Whole/broken classification
+          - Defect classification
+          - Physical dimensions (length, width, area, aspect ratio)
+          - Quality percentages and denominators
+        Top scanner observations are used strictly for secondary verification and discrepancy flags.
+        Top detections are NEVER concatenated or added to the primary grain count.
+        Unresolved bottom clusters are preserved and segregated.
+        If bottom scanner observations are missing or empty, returns an explicit analysis failure.
+        """
+        # 1. Fail-closed if bottom scanner observations are missing or empty
+        if not bottom_obs:
+            return DualViewFusionResult(
+                physical_grains=[],
+                total_physical_grains=0,
+                total_single_physical_grains=0,
+                total_inventory_records=0,
+                matched_count=0,
+                unmatched_bottom_count=0,
+                unmatched_top_count=len(top_obs) if top_obs else 0,
+                ambiguous_count=0,
+                registration_failed_count=0,
+                unresolved_cluster_count=0,
+                discrepancy_count=0,
+                top_image_quality_status=top_quality_status,
+                top_image_quality_metrics=top_quality_metrics or {},
+                architecture_mode="BOTTOM_SCANNER_PRIMARY",
+                primary_scanner="bottom",
+                secondary_scanner="top",
+                estimated_mass_g=0.0,
+                estimated_optical_mass_unvalidated_g=0.0,
+                is_experimental=False,
+                registration_metadata={
+                    "status": "FAILED_BOTTOM_PRIMARY_MISSING",
+                    "message": "Bottom primary scanner observations missing. Bottom-primary architecture strictly prohibits uncertified top-only substitution."
+                },
+                aggregation_summary={
+                    "status": "ANALYSIS_FAILED",
+                    "failure_reason": "BOTTOM_PRIMARY_SCANNER_FAILED",
+                    "primary_scanner": "bottom",
+                    "primary_scanner_available": False,
+                    "count_basis": {"total_physical_grains": 0},
+                    "mass_basis": {"total_mass_g": 0.0},
+                    "stats": [],
+                    "rows": [],
+                    "avg_length_mm": 0.0,
+                    "avg_breadth_mm": 0.0,
+                    "length_breadth_ratio": 0.0
+                }
+            )
+
+        # 2. Run correspondence matching to associate bottom grains with top counterparts
+        match_records = self.correspondence_engine.match_observations(bottom_obs, top_obs)
+
+        physical_grains: List[PhysicalGrain] = []
+        grain_counter = 1
+
+        matched_cnt = 0
+        unmatched_b_cnt = 0
+        unmatched_t_cnt = 0
+        ambiguous_cnt = 0
+        reg_failed_cnt = 0
+        unresolved_cluster_cnt = 0
+        discrepancy_cnt = 0
+
+        # Extract unmatched top observations to record in diagnostics without adding to primary count
+        unmatched_top_obs: List[ViewObservation] = []
+
+        for m in match_records:
+            status: CorrespondenceStatus = m["status"]
+            b_obs: Optional[ViewObservation] = m.get("bottom_obs")
+            t_obs: Optional[ViewObservation] = m.get("top_obs")
+            conf: float = m.get("confidence", 0.0)
+            cost_comps: dict = m.get("cost_components", {})
+
+            # A. If record has NO bottom observation (e.g. UNMATCHED_TOP, top ambiguous, top cluster):
+            # STRICT REQUIREMENT: Do NOT add unmatched top observations to primary grain count!
+            if b_obs is None:
+                if status == CorrespondenceStatus.UNMATCHED_TOP:
+                    unmatched_t_cnt += 1
+                    if t_obs:
+                        unmatched_top_obs.append(t_obs)
+                elif status == CorrespondenceStatus.AMBIGUOUS:
+                    pass
+                elif status == CorrespondenceStatus.SEGMENTATION_UNRESOLVED:
+                    pass
+                continue
+
+            # B. Record corresponds to a BOTTOM observation (authoritative physical grain / cluster)
+            phys_id = f"PHYS_{grain_counter:05d}"
+            grain_counter += 1
+
+            if status == CorrespondenceStatus.MATCHED and t_obs is not None:
+                matched_cnt += 1
+                # Bottom-Primary: Quality and dimensions come authoritatively from bottom
+                b_class = b_obs.defect_class
+                t_class = t_obs.defect_class
+                
+                is_top_verifiable = (top_quality_status == "SUITABLE")
+                if is_top_verifiable:
+                    is_agree = (b_class == t_class)
+                    is_discrepancy = not is_agree
+                    if is_discrepancy:
+                        discrepancy_cnt += 1
+                    verif_str = "VERIFIED_AGREEMENT" if is_agree else "DISCREPANCY_FLAG"
+                    disc_detail = f"Bottom: {b_class} vs Top: {t_class}" if is_discrepancy else None
+                    top_status_str = "MATCHED"
+                else:
+                    # Top image quality gate triggered: NOT_VERIFIABLE
+                    # Task 1 STRICT REQUIREMENT: Do not classify poor image quality as a grain-classification discrepancy!
+                    is_agree = False
+                    is_discrepancy = False
+                    verif_str = "NOT_VERIFIABLE"
+                    disc_detail = "Top image quality unsuitable for optical verification (NOT_VERIFIABLE)"
+                    top_status_str = "NOT_VERIFIABLE"
+
+                mass_g = self._calculate_single_grain_mass(b_obs.area_px, b_obs.length_mm, b_obs.width_mm)
+
+                q_attrs = {
+                    "primary_scanner": "bottom",
+                    "bottom_predicted_class": b_class,
+                    "bottom_confidence": round(b_obs.defect_confidence, 4),
+                    "top_predicted_class": t_class,
+                    "top_confidence": round(t_obs.defect_confidence, 4),
+                    "fused_class": b_class,  # Bottom is authoritative!
+                    "defect_class": b_class, # Bottom is authoritative!
+                    "defect_confidence": round(b_obs.defect_confidence, 4),
+                    "defect_precedence_source": "bottom_primary_authoritative",
+                    "top_match_status": top_status_str,
+                    "is_verified": is_agree,
+                    "discrepancy_flag": is_discrepancy,
+                    "top_verification_status": verif_str,
+                    "discrepancy_details": disc_detail,
+                    "fusion_rule": "bottom_primary_with_top_verification",
+                    "fusion_rule_version": self.defect_fusion_version,
+                    "fusion_applied": True,
+                    "fusion_status": "BOTTOM_PRIMARY",
+                    "is_broken": b_obs.is_broken,
+                    "length_mm": round(b_obs.length_mm, 2),
+                    "width_mm": round(b_obs.width_mm, 2),
+                    "area_px": round(b_obs.area_px, 1),
+                    "aspect_ratio": round(b_obs.aspect_ratio, 2),
+                    "estimated_mass_g": round(mass_g, 5),
+                    "is_cluster": False,
+                    "is_fused": True
+                }
+                prov = {
+                    "matching_algorithm": "Hungarian_Bipartite",
+                    "reprojection_distance_px": m.get("distance_px"),
+                    "cost_components": cost_comps,
+                    "architecture": "BOTTOM_SCANNER_PRIMARY",
+                    "verification": verif_str
+                }
+
+            elif status == CorrespondenceStatus.UNMATCHED_BOTTOM:
+                unmatched_b_cnt += 1
+                mass_g = self._calculate_single_grain_mass(b_obs.area_px, b_obs.length_mm, b_obs.width_mm)
+                q_attrs = {
+                    "primary_scanner": "bottom",
+                    "bottom_predicted_class": b_obs.defect_class,
+                    "bottom_confidence": round(b_obs.defect_confidence, 4),
+                    "top_predicted_class": None,
+                    "top_confidence": None,
+                    "fused_class": b_obs.defect_class,
+                    "defect_class": b_obs.defect_class,
+                    "defect_confidence": round(b_obs.defect_confidence, 4),
+                    "defect_precedence_source": "bottom_primary_unmatched_top",
+                    "top_match_status": "UNMATCHED_IN_TOP",
+                    "top_verification_status": "UNVERIFIED_SINGLE_VIEW" if top_quality_status == "SUITABLE" else "NOT_VERIFIABLE",
+                    "is_verified": False,
+                    "discrepancy_flag": False,
+                    "discrepancy_details": "Observed on bottom platen only (no top match)",
+                    "fusion_rule": "bottom_primary_single_view",
+                    "fusion_rule_version": self.defect_fusion_version,
+                    "fusion_applied": False,
+                    "fusion_status": "BOTTOM_PRIMARY_ONLY",
+                    "is_broken": b_obs.is_broken,
+                    "length_mm": round(b_obs.length_mm, 2),
+                    "width_mm": round(b_obs.width_mm, 2),
+                    "area_px": round(b_obs.area_px, 1),
+                    "aspect_ratio": round(b_obs.aspect_ratio, 2),
+                    "estimated_mass_g": round(mass_g, 5),
+                    "is_cluster": False,
+                    "is_fused": False
+                }
+                prov = {"matching_algorithm": "None", "reason": cost_comps.get("reason"), "architecture": "BOTTOM_SCANNER_PRIMARY"}
+
+            elif status == CorrespondenceStatus.AMBIGUOUS:
+                ambiguous_cnt += 1
+                mass_g = self._calculate_single_grain_mass(b_obs.area_px, b_obs.length_mm, b_obs.width_mm)
+                q_attrs = {
+                    "primary_scanner": "bottom",
+                    "bottom_predicted_class": b_obs.defect_class,
+                    "bottom_confidence": round(b_obs.defect_confidence, 4),
+                    "top_predicted_class": None,
+                    "top_confidence": None,
+                    "fused_class": b_obs.defect_class,
+                    "defect_class": b_obs.defect_class,
+                    "defect_confidence": round(b_obs.defect_confidence, 4),
+                    "defect_precedence_source": "bottom_primary_ambiguous_top",
+                    "top_match_status": "AMBIGUOUS",
+                    "top_verification_status": "AMBIGUOUS",
+                    "is_verified": False,
+                    "discrepancy_flag": True,
+                    "discrepancy_details": "Ambiguous geometric correspondence in top view",
+                    "fusion_rule": "bottom_primary_ambiguous",
+                    "fusion_rule_version": self.defect_fusion_version,
+                    "fusion_applied": False,
+                    "fusion_status": "AMBIGUOUS_TOP_VERIFICATION",
+                    "is_broken": b_obs.is_broken,
+                    "length_mm": round(b_obs.length_mm, 2),
+                    "width_mm": round(b_obs.width_mm, 2),
+                    "area_px": round(b_obs.area_px, 1),
+                    "aspect_ratio": round(b_obs.aspect_ratio, 2),
+                    "estimated_mass_g": round(mass_g, 5),
+                    "is_cluster": False,
+                    "is_fused": False
+                }
+                prov = {"matching_algorithm": "Ambiguity_Detection", "reason": cost_comps.get("reason"), "architecture": "BOTTOM_SCANNER_PRIMARY"}
+
+            elif status == CorrespondenceStatus.SEGMENTATION_UNRESOLVED:
+                # Bottom unresolved multi-grain cluster!
+                unresolved_cluster_cnt += 1
+                mass_g = self._calculate_single_grain_mass(b_obs.area_px, b_obs.length_mm, b_obs.width_mm)
+                q_attrs = {
+                    "primary_scanner": "bottom",
+                    "bottom_predicted_class": "Unresolved Multi-Grain Cluster",
+                    "bottom_confidence": 0.0,
+                    "top_predicted_class": None,
+                    "top_confidence": None,
+                    "fused_class": "Unresolved / Pending Review",
+                    "defect_class": "Unresolved / Pending Review",
+                    "defect_confidence": 0.0,
+                    "defect_precedence_source": "bottom_unresolved_cluster",
+                    "top_match_status": "CLUSTER_SEGREGATED",
+                    "top_verification_status": "CLUSTER_SEGREGATED",
+                    "is_verified": False,
+                    "discrepancy_flag": False,
+                    "discrepancy_details": "Under-segmented touching cluster segregated from single grains",
+                    "fusion_rule": "unresolved_cluster_segregation",
+                    "fusion_rule_version": self.defect_fusion_version,
+                    "fusion_applied": False,
+                    "fusion_status": "UNRESOLVED_CLUSTER",
+                    "is_broken": False,
+                    "length_mm": round(b_obs.length_mm, 2),
+                    "width_mm": round(b_obs.width_mm, 2),
+                    "area_px": round(b_obs.area_px, 1),
+                    "aspect_ratio": round(b_obs.aspect_ratio, 2),
+                    "estimated_mass_g": round(mass_g, 5),
+                    "is_cluster": True,
+                    "separation_status": "under_segmented_cluster",
+                    "is_fused": False
+                }
+                prov = {"matching_algorithm": "Cluster_Segregation", "reason": "Cluster area exceeds single grain threshold", "architecture": "BOTTOM_SCANNER_PRIMARY"}
+
+            elif status == CorrespondenceStatus.REGISTRATION_FAILED:
+                reg_failed_cnt += 1
+                mass_g = self._calculate_single_grain_mass(b_obs.area_px, b_obs.length_mm, b_obs.width_mm)
+                q_attrs = {
+                    "primary_scanner": "bottom",
+                    "bottom_predicted_class": b_obs.defect_class,
+                    "bottom_confidence": round(b_obs.defect_confidence, 4),
+                    "top_predicted_class": None,
+                    "top_confidence": None,
+                    "fused_class": b_obs.defect_class,
+                    "defect_class": b_obs.defect_class,
+                    "defect_confidence": round(b_obs.defect_confidence, 4),
+                    "defect_precedence_source": "bottom_primary_registration_failed",
+                    "top_match_status": "REGISTRATION_FAILED",
+                    "top_verification_status": "REGISTRATION_FAILED",
+                    "is_verified": False,
+                    "discrepancy_flag": False,
+                    "discrepancy_details": "Registration health check failed; secondary verification withheld",
+                    "fusion_rule": "fail_closed_registration",
+                    "fusion_rule_version": self.defect_fusion_version,
+                    "fusion_applied": False,
+                    "fusion_status": "FAIL_CLOSED",
+                    "is_broken": b_obs.is_broken,
+                    "length_mm": round(b_obs.length_mm, 2),
+                    "width_mm": round(b_obs.width_mm, 2),
+                    "area_px": round(b_obs.area_px, 1),
+                    "aspect_ratio": round(b_obs.aspect_ratio, 2),
+                    "estimated_mass_g": round(mass_g, 5),
+                    "is_cluster": False,
+                    "is_fused": False
+                }
+                prov = {"matching_algorithm": "Fail_Closed", "reason": cost_comps.get("reason"), "architecture": "BOTTOM_SCANNER_PRIMARY"}
+
+            else:
+                mass_g = self._calculate_single_grain_mass(b_obs.area_px, b_obs.length_mm, b_obs.width_mm)
+                q_attrs = self._extract_single_view_quality(b_obs, view="bottom")
+                prov = {"matching_algorithm": "Unknown"}
+
+            phys_grain = PhysicalGrain(
+                physical_grain_id=phys_id,
+                correspondence_status=status,
+                correspondence_confidence=conf,
+                bottom_observation_id=b_obs.observation_id if b_obs else None,
+                top_observation_id=t_obs.observation_id if t_obs else None,
+                bottom_obs=b_obs,
+                top_obs=t_obs,
+                quality_attributes=q_attrs,
+                provenance=prov
+            )
+            physical_grains.append(phys_grain)
+
+        # 3. Aggregate Sample Metrics strictly across canonical bottom single grains
+        # Separate single grains from clusters
+        single_grains = [g for g in physical_grains if not g.quality_attributes.get("is_cluster", False)]
+        cluster_grains = [g for g in physical_grains if g.quality_attributes.get("is_cluster", False)]
+
+        # Sample aggregation on single grains only
+        agg_summary, total_mass_g = self._aggregate_physical_sample(single_grains)
+
+        total_single_physical_grains = len(single_grains)
+        total_inventory_records = len(physical_grains)
+
+        # Calculate cross-view count agreement metrics
+        n_bottom = len(bottom_obs)
+        n_top = len(top_obs)
+        diff = abs(n_bottom - n_top)
+        max_n = max(n_bottom, n_top, 1)
+        count_agreement_pct = round(100.0 * (1.0 - (diff / max_n)), 2) if (n_bottom > 0 and n_top > 0) else 0.0
+        if (diff / max_n) <= 0.03:
+            count_tolerance_status = "VERIFIED_EXCELLENT"
+        elif (diff / max_n) <= 0.07:
+            count_tolerance_status = "ADVISORY_DISCREPANCY"
+        else:
+            count_tolerance_status = "HIGH_DISCREPANCY"
+
+        agg_summary["count_agreement_pct"] = count_agreement_pct
+        agg_summary["count_tolerance_status"] = count_tolerance_status
+        agg_summary["bottom_grain_count"] = n_bottom
+        agg_summary["top_grain_count"] = n_top
+
+        return DualViewFusionResult(
+            physical_grains=physical_grains,
+            total_physical_grains=total_single_physical_grains,
+            total_single_physical_grains=total_single_physical_grains,
+            total_inventory_records=total_inventory_records,
+            matched_count=matched_cnt,
+            unmatched_bottom_count=unmatched_b_cnt,
+            unmatched_top_count=unmatched_t_cnt,
+            ambiguous_count=ambiguous_cnt,
+            registration_failed_count=reg_failed_cnt,
+            unresolved_cluster_count=unresolved_cluster_cnt,
+            discrepancy_count=discrepancy_cnt,
+            count_agreement_pct=count_agreement_pct,
+            count_tolerance_status=count_tolerance_status,
+            bottom_grain_count=n_bottom,
+            top_grain_count=n_top,
+            top_image_quality_status=top_quality_status,
+            top_image_quality_metrics=top_quality_metrics or {},
+            architecture_mode="BOTTOM_SCANNER_PRIMARY",
+            primary_scanner="bottom",
+            secondary_scanner="top",
+            estimated_mass_g=total_mass_g,
+            estimated_optical_mass_unvalidated_g=total_mass_g,
+            mass_measurement_status="NOT_PHYSICALLY_MEASURED",
+            is_physically_measured=False,
+            statutory_acceptance_usable=False,
+            is_experimental=False,  # Bottom-primary is the official production delivery mode
+            registration_metadata=self.correspondence_engine.registration.get_health_report(),
+            aggregation_summary=agg_summary
+        )
+
+    def _fuse_views_canonical_symmetric(
         self,
         bottom_obs: List[ViewObservation],
         top_obs: List[ViewObservation]
     ) -> DualViewFusionResult:
         """
-        Executes correspondence matching and synthesizes canonical PhysicalGrain records.
+        Executes Experimental Symmetric Canonical Fusion (Phase 4 / Phase 4.1 Prototype).
+        Preserved behind feature flag for research and experimental benchmarking.
         """
         match_records = self.correspondence_engine.match_observations(bottom_obs, top_obs)
 
@@ -213,6 +707,10 @@ class DualViewFusionEngine:
             ambiguous_count=ambiguous_cnt,
             registration_failed_count=reg_failed_cnt,
             unresolved_cluster_count=unresolved_cluster_cnt,
+            discrepancy_count=0,
+            architecture_mode="EXPERIMENTAL_CANONICAL_FUSION",
+            primary_scanner="dual_symmetric",
+            secondary_scanner="none",
             estimated_mass_g=total_mass_g,
             estimated_optical_mass_unvalidated_g=total_mass_g,
             mass_measurement_status="NOT_PHYSICALLY_MEASURED",
@@ -330,11 +828,11 @@ class DualViewFusionEngine:
             "bottom_confidence": round(obs.defect_confidence, 4) if is_bottom else None,
             "top_predicted_class": obs.defect_class if is_top else None,
             "top_confidence": round(obs.defect_confidence, 4) if is_top else None,
-            "fused_class": None,
+            "fused_class": "Unresolved / Pending Review",
             "defect_class": "Unresolved / Pending Review",
             "defect_confidence": 0.0,
-            "defect_precedence_source": "none",
-            "fusion_rule": "none_withheld",
+            "defect_precedence_source": "none_unfused_safe_fallback",
+            "fusion_rule": "safe_segregation",
             "fusion_rule_version": self.defect_fusion_version,
             "fusion_applied": False,
             "fusion_status": "WITHHELD",
@@ -384,16 +882,44 @@ class DualViewFusionEngine:
 
         lengths, breadths = [], []
 
+        CLASS_MAP = {
+            "NORMAL_RICE": "Good / Head Rice",
+            "WHOLE_RICE": "Good / Head Rice",
+            "WHOLE": "Good / Head Rice",
+            "WHOLE_GRAIN": "Good / Head Rice",
+            "GOOD_GRAIN": "Good / Head Rice",
+            "BROKEN_RICE": "Big Brokens (25-75%)",
+            "BROKEN": "Big Brokens (25-75%)",
+            "BROKEN_GRAIN": "Big Brokens (25-75%)",
+            "SMALL_BROKEN": "Small Brokens (<25%)",
+            "SMALL_BROKEN_RICE": "Small Brokens (<25%)",
+            "DAMAGED_RICE": "Damaged Grains",
+            "DAMAGED": "Damaged Grains",
+            "DAMAGED_GRAIN": "Damaged Grains",
+            "DISCOLORED_RICE": "Discoloured Grains",
+            "DISCOLOURED_RICE": "Discoloured Grains",
+            "DISCOLORED": "Discoloured Grains",
+            "DISCOLOURED": "Discoloured Grains",
+            "DISCOLORED_GRAIN": "Discoloured Grains",
+            "CHALKY_RICE": "Chalky Grains",
+            "CHALKY": "Chalky Grains",
+            "CHALKY_GRAIN": "Chalky Grains",
+            "FOREIGN_MATTER": "Foreign Matter",
+            "FOREIGN_OBJECT": "Foreign Matter",
+            "BOUNDARY_TRUNCATED": "Good / Head Rice",
+        }
+
         for g in grains:
             qa = g.quality_attributes
             mass = qa.get("estimated_mass_g", 0.0)
             dclass = qa.get("defect_class", "Unresolved / Pending Review")
+            mapped_class = CLASS_MAP.get(str(dclass).upper().strip(), dclass)
 
             total_sample_mass_g += mass
 
-            if dclass in category_counts:
-                category_counts[dclass] += 1
-                category_masses[dclass] += mass
+            if mapped_class in category_counts:
+                category_counts[mapped_class] += 1
+                category_masses[mapped_class] += mass
             else:
                 category_counts["Unresolved / Pending Review"] += 1
                 category_masses["Unresolved / Pending Review"] += mass
@@ -426,19 +952,13 @@ class DualViewFusionEngine:
             "chalky_count": category_counts["Chalky Grains"],
             "chalky_pct": round(category_counts["Chalky Grains"] / denom_cnt * 100, 2),
             "unresolved_count": category_counts["Unresolved / Pending Review"],
-            "unresolved_pct": round(category_counts["Unresolved / Pending Review"] / denom_cnt * 100, 2)
+            "unresolved_pct": round(category_counts["Unresolved / Pending Review"] / denom_cnt * 100, 2),
+            "total_broken_count": category_counts["Big Brokens (25-75%)"] + category_counts["Small Brokens (<25%)"],
+            "total_broken_pct": round((category_counts["Big Brokens (25-75%)"] + category_counts["Small Brokens (<25%)"]) / denom_cnt * 100, 2),
         }
 
         mass_basis = {
-            "total_estimated_mass_g": round(total_sample_mass_g, 4),
-            "total_estimated_mass_unvalidated_g": round(total_sample_mass_g, 4),
-            "mass_measurement_status": "NOT_PHYSICALLY_MEASURED",
-            "is_physically_measured": False,
-            "statutory_acceptance_usable": False,
-            "statutory_mass_disclaimer": (
-                "Optical mass is an uncalibrated geometric proxy. Prohibited from statutory "
-                "procurement, tender acceptance, or legal trade decisions without physical balance verification."
-            ),
+            "total_sample_mass_g": round(total_sample_mass_g, 4),
             "whole_mass_g": round(category_masses["Good / Head Rice"], 4),
             "whole_pct": round(category_masses["Good / Head Rice"] / denom_mass * 100, 2),
             "broken_mass_g": round(category_masses["Big Brokens (25-75%)"], 4),
@@ -454,7 +974,16 @@ class DualViewFusionEngine:
             "chalky_mass_g": round(category_masses["Chalky Grains"], 4),
             "chalky_pct": round(category_masses["Chalky Grains"] / denom_mass * 100, 2),
             "unresolved_mass_g": round(category_masses["Unresolved / Pending Review"], 4),
-            "unresolved_pct": round(category_masses["Unresolved / Pending Review"] / denom_mass * 100, 2)
+            "unresolved_pct": round(category_masses["Unresolved / Pending Review"] / denom_mass * 100, 2),
+            "total_broken_mass_g": round(category_masses["Big Brokens (25-75%)"] + category_masses["Small Brokens (<25%)"], 4),
+            "total_broken_pct": round((category_masses["Big Brokens (25-75%)"] + category_masses["Small Brokens (<25%)"]) / denom_mass * 100, 2),
+            "mass_measurement_status": "NOT_PHYSICALLY_MEASURED",
+            "is_physically_measured": False,
+            "statutory_acceptance_usable": False,
+            "statutory_mass_disclaimer": (
+                "Optical mass is an uncalibrated geometric proxy. Prohibited from statutory "
+                "procurement, tender acceptance, or legal trade decisions without physical balance verification."
+            )
         }
 
         stats = [
@@ -465,27 +994,27 @@ class DualViewFusionEngine:
             {"param": "Damaged Grains", "count": count_basis["damaged_count"], "pct": count_basis["damaged_pct"], "mass_g": mass_basis["damaged_mass_g"], "mass_pct": mass_basis["damaged_pct"], "limit": "Max 2.00%"},
             {"param": "Discoloured Grains", "count": count_basis["discoloured_count"], "pct": count_basis["discoloured_pct"], "mass_g": mass_basis["discoloured_mass_g"], "mass_pct": mass_basis["discoloured_pct"], "limit": "Max 1.00%"},
             {"param": "Chalky Grains", "count": count_basis["chalky_count"], "pct": count_basis["chalky_pct"], "mass_g": mass_basis["chalky_mass_g"], "mass_pct": mass_basis["chalky_pct"], "limit": "Max 3.00%"},
-            {"param": "Unresolved Grains", "count": count_basis["unresolved_count"], "pct": count_basis["unresolved_pct"], "mass_g": mass_basis["unresolved_mass_g"], "mass_pct": mass_basis["unresolved_pct"], "limit": "Pending Review"}
         ]
 
+        if category_counts["Unresolved / Pending Review"] > 0:
+            stats.append({
+                "param": "Unresolved Clusters / Review Pending",
+                "count": count_basis["unresolved_count"],
+                "pct": count_basis["unresolved_pct"],
+                "mass_g": mass_basis["unresolved_mass_g"],
+                "mass_pct": mass_basis["unresolved_pct"],
+                "limit": "Max 0.00% (Informational)"
+            })
+
         summary = {
-            "total_physical_grains": total_physical_count,
-            "total_estimated_mass_g": round(total_sample_mass_g, 4),
-            "total_estimated_mass_unvalidated_g": round(total_sample_mass_g, 4),
-            "mass_measurement_status": "NOT_PHYSICALLY_MEASURED",
-            "is_physically_measured": False,
-            "statutory_acceptance_usable": False,
-            "statutory_mass_disclaimer": (
-                "Optical mass is an uncalibrated geometric proxy. Prohibited from statutory "
-                "procurement, tender acceptance, or legal trade decisions without physical balance verification."
-            ),
-            "avg_length_mm": round(avg_len, 2),
-            "avg_breadth_mm": round(avg_brd, 2),
-            "length_breadth_ratio": round(avg_len / max(avg_brd, 0.01), 2),
             "count_basis": count_basis,
             "mass_basis": mass_basis,
             "stats": stats,
-            "is_single_grain_non_doubled": True
+            "avg_length_mm": round(avg_len, 2),
+            "avg_breadth_mm": round(avg_brd, 2),
+            "length_breadth_ratio": round(avg_len / max(avg_brd, 0.01), 2),
+            "total_physical_count": total_physical_count,
+            "total_mass_g": round(total_sample_mass_g, 4)
         }
 
         return summary, total_sample_mass_g

@@ -1,3 +1,4 @@
+import os
 # Configuration parameters for the Rice Grain Quality Analyzer pipeline.
 
 from dataclasses import dataclass, field
@@ -35,6 +36,8 @@ class SegmentationConfig:
     runtime: str = "auto"  # 'auto', 'onnx', 'pytorch'
     yolo_weights_path: str = "runs/rice_seg_yolo11s_1280/weights/best.pt"
     yolo_onnx_path: str = "runs/rice_seg_yolo11s_1280/weights/best.onnx"
+    conf_threshold: float = 0.15  # YOLO segmentation confidence threshold (captures faint/touching grains down to 0.15)
+    max_det: int = 3000  # maximum detection instances in YOLO NMS (prevents silent truncation)
     # Morphological cleaning (for classic engine)
     morph_kernel_size: int = 3
     min_object_area_px: int = 40  # filter out dust/noise < 40 px
@@ -43,6 +46,8 @@ class SegmentationConfig:
 
 @dataclass
 class SeparationConfig:
+    # Separation Profile: 'baseline' (safe rollback) or 'candidate_2' (optimized balanced)
+    profile: str = "baseline"
     # Touching grain separation (watershed & distance transform) settings.
     enable_watershed: bool = True
     # Area threshold above which a connected component is scrutinized as a cluster
@@ -52,9 +57,34 @@ class SeparationConfig:
     # Distance transform peak finding parameters
     min_peak_distance_px: int = 8
     peak_threshold_rel: float = 0.35
+    # Enable selective cluster recovery on under-segmented clusters
+    enable_selective_cluster_recovery: bool = False
     # Maximum allowed clusters to split
     max_cluster_area_px: int = 15000
 
+    def apply_profile(self, profile_name: str) -> None:
+        p = (profile_name or "").strip().lower()
+        if p in ("candidate_2", "candidate2", "cand2"):
+            self.profile = "candidate_2"
+            self.min_peak_distance_px = 6
+            self.peak_threshold_rel = 0.32
+            self.solidity_threshold = 0.92
+            self.enable_selective_cluster_recovery = True
+        elif p in ("baseline", "base", "default"):
+            self.profile = "baseline"
+            self.min_peak_distance_px = 8
+            self.peak_threshold_rel = 0.35
+            self.solidity_threshold = 0.92
+            self.enable_selective_cluster_recovery = False
+        else:
+            raise ValueError(f"Unknown separation profile '{profile_name}'. Must be 'baseline' or 'candidate_2'.")
+
+    def __post_init__(self):
+        env_p = os.environ.get("RICEAGE_SEPARATION_PROFILE") or os.environ.get("RICEAGE_PROFILE")
+        if env_p:
+            self.apply_profile(env_p)
+        elif self.profile:
+            self.apply_profile(self.profile)
 
 @dataclass
 class MeasurementConfig:
@@ -83,8 +113,46 @@ class ClassificationConfig:
 
 @dataclass
 class DualViewConfig:
+    # Operational Mode Selection: 'single_view' (default) or 'bottom_primary_verification' (Mode C)
+    mode: str = "single_view"
     # Feature flag to enable experimental dual-view registration & fusion
     enabled: bool = False  # Feature flag default: False (safe single-view baseline preserved)
+    # Architecture Mode: 'bottom_primary' (single view) or 'bottom_primary_verification' (Mode C)
+    architecture_mode: str = "bottom_primary"
+
+    def __post_init__(self):
+        env_mode = os.environ.get("RICEAGE_DUAL_VIEW_MODE")
+        if env_mode:
+            self.apply_mode(env_mode)
+
+    def apply_mode(self, mode_name: str) -> None:
+        clean = mode_name.strip().lower()
+        if clean in ("single_view", "single", "bottom_primary_only", "baseline"):
+            self.mode = "single_view"
+            self.enabled = False
+            self.architecture_mode = "bottom_primary"
+        elif clean in ("bottom_primary_verification", "mode_c", "verification"):
+            self.mode = "bottom_primary_verification"
+            self.enabled = True
+            self.architecture_mode = "bottom_primary_verification"
+        elif clean in ("symmetric", "experimental_canonical_fusion", "canonical_fusion", "mode_b"):
+            raise ValueError(
+                "Symmetric dual-view fusion (Mode B) is strictly prohibited from production "
+                "to prevent +78% grain count inflation and statutory non-compliance. "
+                "Supported modes: 'single_view' (default) or 'bottom_primary_verification'."
+            )
+        else:
+            raise ValueError(
+                f"Unknown dual-view operational mode: '{mode_name}'. "
+                "Supported modes: 'single_view' (default) or 'bottom_primary_verification'."
+            )
+    primary_scanner: str = "bottom"
+    secondary_scanner: str = "top"
+    # Secondary Top Image Quality Gate Thresholds
+    top_min_laplacian_variance: float = 8.0   # Blur threshold on top image foreground
+    top_min_contrast: float = 12.0             # RMS contrast minimum floor
+    top_min_brightness: float = 15.0           # Underexposure minimum floor
+    top_max_brightness: float = 240.0          # Overexposure saturation ceiling
     # Registration & Matching Parameters (raw sensor pixel coordinates at 600 DPI)
     max_matching_distance_px: float = 35.0  # Max distance in unified raw sensor coords
     ambiguity_delta_px: float = 8.0          # Nearest-neighbor ambiguity margin

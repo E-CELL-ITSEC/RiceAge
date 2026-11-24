@@ -2,6 +2,8 @@
 Dual-View Canonical Data Models for RiceAge Multi-Scanner System.
 Establishes a single canonical PhysicalGrain record per physical grain,
 linking ViewObservation records from bottom and top optical platens.
+In Bottom-Primary Architecture, bottom scanner observations are authoritative,
+while top scanner observations provide secondary verification only.
 """
 
 from dataclasses import dataclass, field, asdict
@@ -19,6 +21,22 @@ class CorrespondenceStatus(str, Enum):
     AMBIGUOUS = "AMBIGUOUS"
     REGISTRATION_FAILED = "REGISTRATION_FAILED"
     SEGMENTATION_UNRESOLVED = "SEGMENTATION_UNRESOLVED"
+
+
+class TopImageQualityStatus(str, Enum):
+    """
+    Quality gate assessment statuses for secondary top platen image.
+    When top image is degraded (blurry, underexposed, overexposed), top verification
+    must yield NOT_VERIFIABLE without misclassifying optical quality failure as a
+    grain classification discrepancy.
+    """
+    SUITABLE = "SUITABLE"
+    NOT_VERIFIABLE = "NOT_VERIFIABLE"
+    BLURRY = "BLURRY"
+    UNDEREXPOSED = "UNDEREXPOSED"
+    OVEREXPOSED = "OVEREXPOSED"
+    LOW_CONTRAST = "LOW_CONTRAST"
+    UNAVAILABLE = "UNAVAILABLE"
 
 
 @dataclass
@@ -115,6 +133,8 @@ class DualViewFusionResult:
     Consolidated container for the dual-view prototype output.
     Enforces strict distinction between single physical grains, multi-grain clusters,
     and unvalidated optical mass proxies.
+    In Bottom-Primary Architecture, bottom scanner observations are authoritative,
+    while top scanner observations provide secondary verification only.
     """
     physical_grains: List[PhysicalGrain]
     total_physical_grains: int  # Total individual physical grain candidates
@@ -128,7 +148,17 @@ class DualViewFusionResult:
     unresolved_cluster_count: int  # Multi-grain clusters segregated from single grains
     estimated_mass_g: float
     estimated_optical_mass_unvalidated_g: float
-    is_experimental: bool = True
+    is_experimental: bool = False
+    architecture_mode: str = "BOTTOM_SCANNER_PRIMARY"
+    primary_scanner: str = "bottom"
+    secondary_scanner: str = "top"
+    discrepancy_count: int = 0
+    count_agreement_pct: float = 100.0
+    count_tolerance_status: str = "VERIFIED_EXCELLENT"
+    bottom_grain_count: int = 0
+    top_grain_count: int = 0
+    top_image_quality_status: str = "SUITABLE"
+    top_image_quality_metrics: Dict[str, Any] = field(default_factory=dict)
     mass_measurement_status: str = "NOT_PHYSICALLY_MEASURED"
     is_physically_measured: bool = False
     statutory_acceptance_usable: bool = False
@@ -150,6 +180,16 @@ class DualViewFusionResult:
             "ambiguous_count": self.ambiguous_count,
             "registration_failed_count": self.registration_failed_count,
             "unresolved_cluster_count": self.unresolved_cluster_count,
+            "discrepancy_count": self.discrepancy_count,
+            "count_agreement_pct": self.count_agreement_pct,
+            "count_tolerance_status": self.count_tolerance_status,
+            "bottom_grain_count": self.bottom_grain_count,
+            "top_grain_count": self.top_grain_count,
+            "top_image_quality_status": self.top_image_quality_status,
+            "top_image_quality_metrics": self.top_image_quality_metrics,
+            "architecture_mode": self.architecture_mode,
+            "primary_scanner": self.primary_scanner,
+            "secondary_scanner": self.secondary_scanner,
             "estimated_mass_g": round(self.estimated_mass_g, 4),
             "estimated_optical_mass_unvalidated_g": round(self.estimated_optical_mass_unvalidated_g, 4),
             "mass_measurement_status": self.mass_measurement_status,

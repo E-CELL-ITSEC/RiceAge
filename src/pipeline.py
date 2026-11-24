@@ -1,3 +1,4 @@
+import logging
 # End-to-end execution pipeline for Rice Grain Quality Analyzer.
 
 import os
@@ -25,6 +26,9 @@ from src.reporting import (
     export_summary_json,
     generate_experiment_report,
 )
+
+
+logger = logging.getLogger("RiceAge.Pipeline")
 
 
 class RiceQualityPipeline:
@@ -127,7 +131,8 @@ class RiceQualityPipeline:
         self,
         image_path: str,
         raw_reference_path: Optional[str] = None,
-        generate_outputs: bool = True
+        generate_outputs: bool = True,
+        skip_classification: bool = False
     ) -> Dict[str, Any]:
         # Execute complete pipeline on an input image.
         if not os.path.exists(image_path):
@@ -155,6 +160,13 @@ class RiceQualityPipeline:
         )
 
         spatial_params = self._scale_spatial_parameters(img_h, img_w)
+        active_profile = getattr(self.config.separation, "profile", "baseline")
+        logger.info(
+            f"Active Separation Profile: '{active_profile}' "
+            f"(min_peak_dist={spatial_params['min_peak_dist']}, "
+            f"peak_thresh={self.config.separation.peak_threshold_rel}, "
+            f"selective_recovery={self.config.separation.enable_selective_cluster_recovery})"
+        )
 
         # Stage 1: Segmentation Engine Selection (YOLO Deep Learning vs Classic Watershed)
         use_yolo = (
@@ -166,9 +178,9 @@ class RiceQualityPipeline:
             instance_mask, clean_mask, grain_diagnostics, separation_stats = segment_yolo(
                 cleaned_bgr,
                 weights_path=self.config.segmentation.yolo_weights_path,
-                conf_threshold=0.25,
+                conf_threshold=getattr(self.config.segmentation, "conf_threshold", 0.15),
                 imgsz=1280,
-                max_det=2000
+                max_det=getattr(self.config.segmentation, "max_det", 3000)
             )
             otsu_val = 0.0
             seg_comparison = {
@@ -187,9 +199,7 @@ class RiceQualityPipeline:
                 gaussian_sigma=self.config.preprocessing.gaussian_sigma
             )
 
-            # binarize.compare_segmentation_methods: benchmark Otsu against adaptive, triangle, Yen, and Li algorithms
-            seg_comparison = compare_segmentation_methods(smoothed)
-            # binarize.segment_otsu: binarize smoothed grayscale image using Otsu global optimal thresholding
+            # Fast Otsu binarization directly (avoiding 5x redundant algorithms benchmark on production scan)
             binary_raw, otsu_val = segment_otsu(smoothed)
 
             # morphology.cleanup_mask: perform binary hole-filling, morphological opening, and small-noise removal
@@ -207,8 +217,18 @@ class RiceQualityPipeline:
                 peak_threshold_rel=self.config.separation.peak_threshold_rel,
                 cluster_area_thresh_px=spatial_params["cluster_area_thresh"],
                 solidity_thresh=self.config.separation.solidity_threshold,
-                min_valid_area_px=spatial_params["min_valid_area"]
+                min_valid_area_px=spatial_params["min_valid_area"],
+                enable_concave_fallback=getattr(self.config.separation, "enable_selective_cluster_recovery", False)
             )
+
+            seg_comparison = {
+                "otsu": {
+                    "threshold_value": float(otsu_val),
+                    "foreground_ratio": float(np.mean(clean_mask > 0)) if clean_mask is not None else 0.0,
+                    "raw_connected_components": len(grain_diagnostics),
+                    "edge_gradient_magnitude": 0.0
+                }
+            }
 
         # Stage 2: Measurement & Feature Extraction
         df_measurements, _ = measure_all_grains(
@@ -226,7 +246,13 @@ class RiceQualityPipeline:
             os.path.exists(self.config.classification.classifier_weights_path)
         )
 
-        if use_ai:
+        if skip_classification:
+            df_classified = df_measurements.copy()
+            df_classified["quality_class"] = "Good / Head Rice"
+            df_classified["classification"] = "Good / Head Rice"
+            df_classified["confidence"] = 1.0
+            df_classified["is_broken"] = False
+        elif use_ai:
             df_classified = classify_grains_ai(
                 df_measurements,
                 original_bgr,
@@ -288,15 +314,23 @@ class RiceQualityPipeline:
                 "selected_threshold_val": otsu_val,
                 "method_comparison": {
                     k: {
-                        "threshold_value": v["threshold_value"],
-                        "foreground_ratio": v["foreground_ratio"],
-                        "raw_connected_components": v["raw_connected_components"],
-                        "edge_gradient_magnitude": v["edge_gradient_magnitude"],
+                        "threshold_value": v.get("threshold_value", otsu_val),
+                        "foreground_ratio": v.get("foreground_ratio", 0.0),
+                        "raw_connected_components": v.get("raw_connected_components", 0),
+                        "edge_gradient_magnitude": v.get("edge_gradient_magnitude", 0.0),
                     }
                     for k, v in seg_comparison.items()
                 }
             },
             "separation": separation_stats,
+            "separation_profile": active_profile,
+            "separation_config": {
+                "profile": active_profile,
+                "min_peak_distance_px": self.config.separation.min_peak_distance_px,
+                "peak_threshold_rel": self.config.separation.peak_threshold_rel,
+                "solidity_threshold": self.config.separation.solidity_threshold,
+                "enable_selective_cluster_recovery": getattr(self.config.separation, "enable_selective_cluster_recovery", False),
+            },
             "quality_counts": quality_counts,
             "defect_breakdown": defect_breakdown,
             "status_counts": status_counts,

@@ -50,7 +50,12 @@ def correspondence_engine(calibrated_registration):
 
 @pytest.fixture
 def fusion_engine(correspondence_engine):
-    return DualViewFusionEngine(correspondence_engine=correspondence_engine, pixel_scale_mm=0.08467)
+    # Preserves Phase 4/4.1 experimental canonical fusion feature flag for backward compatibility testing
+    return DualViewFusionEngine(
+        correspondence_engine=correspondence_engine,
+        pixel_scale_mm=0.08467,
+        architecture_mode="experimental_canonical_fusion"
+    )
 
 
 def make_obs(
@@ -220,7 +225,7 @@ def test_registration_failure_triggers_safe_fallback():
     assert bad_reg.is_healthy is False
 
     engine = DualViewCorrespondenceEngine(registration=bad_reg)
-    fusion = DualViewFusionEngine(correspondence_engine=engine)
+    fusion = DualViewFusionEngine(correspondence_engine=engine, architecture_mode="experimental_canonical_fusion")
 
     b_obs = [make_obs("bottom", 1, 500.0, 500.0)]
     t_obs = [make_obs("top", 1, 500.0, 500.0)]
